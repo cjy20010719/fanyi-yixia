@@ -7,9 +7,10 @@
 static NSString * const YiShortcutCapture=@"capture";
 static NSString * const YiShortcutSelection=@"selection";
 static NSString * const YiShortcutOpen=@"open";
+static NSString * const YiShortcutAutomatic=@"automatic";
 static NSEventModifierFlags YiShortcutModifierMask(void) { return NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagShift|NSEventModifierFlagCommand; }
-static NSArray<NSString *> *YiShortcutActions(void) { return @[YiShortcutOpen,YiShortcutSelection,YiShortcutCapture]; }
-static NSString *YiShortcutActionName(NSString *action) { return [@{YiShortcutOpen:@"打开",YiShortcutSelection:@"划词翻译",YiShortcutCapture:@"截图翻译"} objectForKey:action] ?: action; }
+static NSArray<NSString *> *YiShortcutActions(void) { return @[YiShortcutOpen,YiShortcutSelection,YiShortcutCapture,YiShortcutAutomatic]; }
+static NSString *YiShortcutActionName(NSString *action) { return [@{YiShortcutAutomatic:@"自动划词",YiShortcutOpen:@"打开",YiShortcutSelection:@"划词翻译",YiShortcutCapture:@"截图翻译"} objectForKey:action] ?: action; }
 static NSError *YiShortcutError(NSString *message) { return [NSError errorWithDomain:@"Yi.Shortcuts" code:1 userInfo:@{NSLocalizedDescriptionKey:message}]; }
 
 @interface YiShortcut : NSObject <NSCopying>
@@ -98,10 +99,10 @@ static NSError *YiShortcutError(NSString *message) { return [NSError errorWithDo
 @end
 
 static NSDictionary<NSString *,YiShortcut *> *YiDefaultShortcuts(void) {
-    return @{YiShortcutCapture:[YiShortcut shortcutWithKeyCode:kVK_ANSI_S modifiers:NSEventModifierFlagOption],YiShortcutSelection:[YiShortcut shortcutWithKeyCode:kVK_ANSI_A modifiers:NSEventModifierFlagOption],YiShortcutOpen:[YiShortcut shortcutWithKeyCode:kVK_ANSI_A modifiers:NSEventModifierFlagOption|NSEventModifierFlagCommand]};
+    return @{YiShortcutAutomatic:[YiShortcut shortcutWithKeyCode:kVK_ANSI_D modifiers:NSEventModifierFlagOption],YiShortcutCapture:[YiShortcut shortcutWithKeyCode:kVK_ANSI_S modifiers:NSEventModifierFlagOption],YiShortcutSelection:[YiShortcut shortcutWithKeyCode:kVK_ANSI_A modifiers:NSEventModifierFlagOption],YiShortcutOpen:[YiShortcut shortcutWithKeyCode:kVK_ANSI_A modifiers:NSEventModifierFlagOption|NSEventModifierFlagCommand]};
 }
 static BOOL YiValidateShortcuts(NSDictionary *shortcuts,NSError **error) {
-    if(![shortcuts isKindOfClass:NSDictionary.class] || shortcuts.count!=3) { if(error) *error=YiShortcutError(@"快捷键配置不完整，请恢复默认后重试。");return NO; }
+    if(![shortcuts isKindOfClass:NSDictionary.class] || shortcuts.count!=YiShortcutActions().count) { if(error) *error=YiShortcutError(@"快捷键配置不完整，请恢复默认后重试。");return NO; }
     NSMutableSet *seen=[NSMutableSet new];
     for(NSString *action in YiShortcutActions()) {
         YiShortcut *shortcut=shortcuts[action];
@@ -113,7 +114,18 @@ static BOOL YiValidateShortcuts(NSDictionary *shortcuts,NSError **error) {
 static NSDictionary<NSString *,YiShortcut *> *YiShortcutsFromPropertyList(id value) {
     if(![value isKindOfClass:NSDictionary.class]) return YiDefaultShortcuts();
     NSMutableDictionary *result=[NSMutableDictionary new];
-    for(NSString *action in YiShortcutActions()) { YiShortcut *shortcut=[YiShortcut fromPropertyList:value[action]]; if(!shortcut) return YiDefaultShortcuts();result[action]=shortcut; }
+    for(NSString *action in YiShortcutActions()) { YiShortcut *shortcut=[YiShortcut fromPropertyList:value[action]];
+        if(!shortcut && [action isEqual:YiShortcutAutomatic] && [value count]==3 && !value[action]) {
+            shortcut=YiDefaultShortcuts()[action];
+            // Preserve existing custom bindings if a legacy action already uses Option D.
+            if([result.allValues containsObject:shortcut]) {
+                for(UInt32 key=kVK_F13;key<=127;key++) {
+                    YiShortcut *candidate=[YiShortcut shortcutWithKeyCode:key modifiers:NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagCommand];
+                    if([candidate validate:NULL] && ![result.allValues containsObject:candidate]) {shortcut=candidate;break;}
+                }
+            }
+        }
+        if(!shortcut) return YiDefaultShortcuts();result[action]=shortcut; }
     return YiValidateShortcuts(result,NULL) ? result.copy : YiDefaultShortcuts();
 }
 static NSDictionary *YiShortcutsPropertyList(NSDictionary<NSString *,YiShortcut *> *shortcuts) {
@@ -156,16 +168,16 @@ typedef BOOL (^YiShortcutApplyBlock)(NSDictionary<NSString *,YiShortcut *> *shor
 @end
 @implementation YiShortcutPreferencesController
 - (instancetype)initWithShortcuts:(NSDictionary<NSString *,YiShortcut *> *)shortcuts apply:(YiShortcutApplyBlock)apply {
-    NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,480,348) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+    NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,480,397) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
     if((self=[super initWithWindow:window])) {
         self.originalShortcuts=YiValidateShortcuts(shortcuts,NULL) ? shortcuts.copy : YiDefaultShortcuts(); self.editingShortcuts=self.originalShortcuts.mutableCopy;self.applyChanges=apply;
         window.title=@"快捷键";window.releasedWhenClosed=NO;window.delegate=self;window.titlebarAppearsTransparent=YES;window.backgroundColor=NSColor.windowBackgroundColor;
         NSView *content=window.contentView;
-        NSTextField *heading=[NSTextField labelWithString:@"键盘快捷键"];heading.font=[NSFont systemFontOfSize:22 weight:NSFontWeightMedium];heading.frame=NSMakeRect(28,284,424,30);[content addSubview:heading];
-        NSTextField *hint=[NSTextField labelWithString:@"点击右侧按键，再按下你想使用的组合。Esc 取消录入。"];hint.font=[NSFont systemFontOfSize:12];hint.textColor=NSColor.secondaryLabelColor;hint.frame=NSMakeRect(28,258,424,20);[content addSubview:hint];
+        NSTextField *heading=[NSTextField labelWithString:@"键盘快捷键"];heading.font=[NSFont systemFontOfSize:22 weight:NSFontWeightMedium];heading.frame=NSMakeRect(28,333,424,30);[content addSubview:heading];
+        NSTextField *hint=[NSTextField labelWithString:@"点击右侧按键，再按下你想使用的组合。Esc 取消录入。"];hint.font=[NSFont systemFontOfSize:12];hint.textColor=NSColor.secondaryLabelColor;hint.frame=NSMakeRect(28,307,424,20);[content addSubview:hint];
         self.recordingButtons=[NSMutableDictionary new];NSArray *actions=YiShortcutActions();
         for(NSUInteger i=0;i<actions.count;i++) {
-            NSString *action=actions[i];CGFloat y=206-i*49;
+            NSString *action=actions[i];CGFloat y=255-i*49;
             NSTextField *label=[NSTextField labelWithString:YiShortcutActionName(action)];label.font=[NSFont systemFontOfSize:14];label.frame=NSMakeRect(32,y+7,200,22);[content addSubview:label];
             YiShortcutRecorderButton *button=[YiShortcutRecorderButton buttonWithTitle:@"" target:self action:@selector(recordClicked:)];button.frame=NSMakeRect(266,y,184,34);button.bezelStyle=NSBezelStyleRounded;button.font=[NSFont systemFontOfSize:14 weight:NSFontWeightMedium];button.recorder=self;button.actionIdentifier=action;button.toolTip=@"点击后按组合键，Esc 取消";button.accessibilityLabel=[YiShortcutActionName(action) stringByAppendingString:@"快捷键"];[content addSubview:button];self.recordingButtons[action]=button;
         }

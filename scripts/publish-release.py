@@ -5,7 +5,7 @@ from pathlib import Path
 from github_api import api
 root=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--notes',type=Path,required=True);p.add_argument('--publish',action='store_true');p.add_argument('--appcast',type=Path,default=root/'dist/appcast.xml');a=p.parse_args()
-d=plistlib.loads((root/'Info.plist').read_bytes());version=d['CFBundleShortVersionString'];tag='v'+version;base='/repos/cjy20010719/Yi'
+d=plistlib.loads((root/'Info.plist').read_bytes());version=d['CFBundleShortVersionString'];tag='v'+version;base='/repos/cjy20010719/fanyi-yixia'
 assert api('GET',base)['private'] is False,'Release repository must be public'
 tracked=subprocess.check_output(['git','ls-files'],cwd=root,text=True).splitlines()
 assert not any(Path(f).suffix in ('.key','.pem','.p12','.p8','.ed25519') or 'Yi-private' in f or f.startswith(('backups/','dist/','Vendor/')) for f in tracked),'Private/build files must not be tracked'

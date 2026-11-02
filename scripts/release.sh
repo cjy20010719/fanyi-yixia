@@ -21,7 +21,7 @@ zsh package.sh
 zsh scripts/test.sh
 python3 scripts/verify-release.py
 [[ ! -f docs/appcast.xml ]] || cp docs/appcast.xml dist/appcast.xml
-python3 scripts/make-appcast.py "dist/releases/Yi-${release_version}-universal.zip" --url "https://github.com/cjy20010719/Yi/releases/download/v${release_version}/Yi-${release_version}-universal.zip" --output dist/appcast.xml --notes "$(cat "$release_notes")"
+python3 scripts/make-appcast.py "dist/releases/Yi-${release_version}-universal.zip" --url "https://github.com/cjy20010719/fanyi-yixia/releases/download/v${release_version}/Yi-${release_version}-universal.zip" --output dist/appcast.xml --notes "$(cat "$release_notes")"
 git add Info.plist README.md "$release_notes"
 git commit -m "Release Yi $release_version"
 git tag "v$release_version"

@@ -6,7 +6,7 @@ s=(root/'Sources/main.m').read_text();block=s[s.index('- (void)updateStatusIcon 
 assert hashlib.sha256(block.encode()).hexdigest()=='3e729f0e59bfbf5ee6b95fe56a18bd9d51c5beec384ee4441318af6bf91927a0','Menu bar icon implementation changed'
 p=plistlib.loads((root/'Info.plist').read_bytes())
 assert p['CFBundleIdentifier']=='local.chenshanglong.Translate'
-assert p['SUFeedURL']=='https://cjy20010719.github.io/Yi/appcast.xml'
+assert p['SUFeedURL']=='https://cjy20010719.github.io/fanyi-yixia/appcast.xml'
 assert p['SUPublicEDKey']=='kOg7EiYbSf1G9V1V0JtVkfSQiIeqse2VA7R7n9RGJv0='
 assert p['SUVerifyUpdateBeforeExtraction'] and p['SURequireSignedFeed']
 assert p['SUSignedFeedFailureExpirationInterval']==0

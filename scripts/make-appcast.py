@@ -14,7 +14,7 @@ sig=subprocess.check_output([str(tool),*signing,'-p',str(a.archive)],text=True).
 assert len(base64.b64decode(sig,validate=True))==64,'Signing did not return a valid EdDSA signature'
 subprocess.run([os.environ.get('YI_NODE_PATH','node'),str(root/'scripts/verify-ed25519.cjs'),d['SUPublicEDKey'],sig,str(a.archive)],check=True)
 ns='http://www.andymatuschak.org/xml-namespaces/sparkle';ET.register_namespace('sparkle',ns)
-rss=ET.Element('rss',version='2.0');channel=ET.SubElement(rss,'channel');ET.SubElement(channel,'title').text='翻译一下更新';ET.SubElement(channel,'link').text='https://github.com/cjy20010719/Yi';ET.SubElement(channel,'description').text='翻译一下 macOS updates'
+rss=ET.Element('rss',version='2.0');channel=ET.SubElement(rss,'channel');ET.SubElement(channel,'title').text='翻译一下更新';ET.SubElement(channel,'link').text='https://github.com/cjy20010719/fanyi-yixia';ET.SubElement(channel,'description').text='翻译一下 macOS updates'
 item=ET.SubElement(channel,'item');ET.SubElement(item,'title').text='翻译一下 '+d['CFBundleShortVersionString'];ET.SubElement(item,'pubDate').text=datetime.datetime.now(datetime.timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
 for key,value in [('version',d['CFBundleVersion']),('shortVersionString',d['CFBundleShortVersionString']),('minimumSystemVersion',d['LSMinimumSystemVersion'])]:ET.SubElement(item,'{'+ns+'}'+key).text=value
 ET.SubElement(item,'description').text=a.notes

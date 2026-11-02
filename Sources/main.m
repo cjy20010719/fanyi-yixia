@@ -995,10 +995,14 @@ static CGImageRef CreateCaptureCrop(CaptureFrame *source, NSRect selection) CF_R
         if(y<8) y=pointer.y+9;
         [dimensions drawAtPoint:NSMakePoint(MAX(8,x),MIN(y,NSMaxY(self.bounds)-size.height-8)) withAttributes:attrs];
     }
-    NSString *hint=self.dragging ? @"松开翻译 · Esc / 鼠标右键取消" : @"拖动框选 · Esc / 鼠标右键取消";
-    NSDictionary *hintAttrs=@{NSFontAttributeName:[NSFont systemFontOfSize:11 weight:NSFontWeightRegular],NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.2 alpha:1],NSShadowAttributeName:textShadow};
+    NSString *hint=self.dragging ? @"松开鼠标翻译  ·  Esc 或右键取消" : @"拖动框选翻译  ·  Esc 或右键取消";
+    NSShadow *hintShadow=[NSShadow new];
+    hintShadow.shadowColor=[NSColor colorWithCalibratedWhite:0 alpha:0.8];
+    hintShadow.shadowBlurRadius=3;
+    hintShadow.shadowOffset=NSMakeSize(0,-1);
+    NSDictionary *hintAttrs=@{NSFontAttributeName:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.whiteColor,NSStrokeColorAttributeName:[NSColor colorWithCalibratedWhite:0 alpha:0.75],NSStrokeWidthAttributeName:@(-2),NSShadowAttributeName:hintShadow};
     NSSize hintSize=[hint sizeWithAttributes:hintAttrs];
-    [hint drawAtPoint:NSMakePoint((self.bounds.size.width-hintSize.width)/2,26) withAttributes:hintAttrs];
+    [hint drawAtPoint:NSMakePoint(round((self.bounds.size.width-hintSize.width)/2),34) withAttributes:hintAttrs];
 }
 - (void)completeSelection:(NSRect)rect {
     if (self.finished) return;
@@ -1186,6 +1190,7 @@ static BOOL WasLaunchedAtLogin(NSAppleEventDescriptor *event) {
 @property EventHotKeyRef captureHotkey;
 @property EventHotKeyRef selectionHotkey;
 @property EventHotKeyRef openHotkey;
+@property EventHotKeyRef automaticHotkey;
 @property NSDictionary<NSString *,YiShortcut *> *shortcuts;
 @property YiShortcutPreferencesController *shortcutPreferences;
 @property BOOL shortcutsSuspended;
@@ -1201,12 +1206,13 @@ static BOOL WasLaunchedAtLogin(NSAppleEventDescriptor *event) {
 - (void)translateSelectedText:(id)sender;
 - (void)showSetup:(id)sender;
 - (void)showShortcutPreferences:(id)sender;
+- (void)toggle:(id)sender;
 @end
 
 static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef event, void *context) {
     EventHotKeyID identifier = {0};
     OSStatus status=GetEventParameter(event,kEventParamDirectObject,typeEventHotKeyID,NULL,sizeof(identifier),NULL,&identifier);
-    if (status!=noErr || identifier.signature!='Trns' || identifier.id<1 || identifier.id>3) return eventNotHandledErr;
+    if (status!=noErr || identifier.signature!='Trns' || identifier.id<1 || identifier.id>4) return eventNotHandledErr;
     AppDelegate *delegate = (__bridge AppDelegate *)context;
     // The main dispatch queue can be starved by AppKit's menu tracking loop.
     // Common run-loop modes keep the shortcut responsive while a menu is open.
@@ -1214,6 +1220,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         if(delegate.shortcutsSuspended) return;
         if (identifier.id==1) { [delegate capture:nil]; [delegate dismissStatusMenu]; }
         else if(identifier.id==2) [delegate translateSelectedText:nil];
+        else if(identifier.id==4) { [delegate dismissStatusMenu]; [delegate toggle:nil]; }
         else { [delegate dismissStatusMenu]; dispatch_async(dispatch_get_main_queue(),^{ [delegate showSetup:nil]; }); }
     });
     CFRunLoopWakeUp(CFRunLoopGetMain());
@@ -1242,7 +1249,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     NSMenuItem *main = [menu addItemWithTitle:@"打开" action:@selector(showSetup:) keyEquivalent:@""]; main.target = self;
     NSMenuItem *selection = [menu addItemWithTitle:@"划词翻译" action:@selector(translateSelectedText:) keyEquivalent:@""]; selection.target = self;
     NSMenuItem *capture = [menu addItemWithTitle:@"截图翻译" action:@selector(capture:) keyEquivalent:@""]; capture.target = self;
-    self.pauseItem = [menu addItemWithTitle:@"暂停自动划词" action:@selector(toggle:) keyEquivalent:@""]; self.pauseItem.target = self;
+    self.pauseItem = [menu addItemWithTitle:@"自动划词" action:@selector(toggle:) keyEquivalent:@""]; self.pauseItem.target = self;
     self.compatibilityMenuItem=[menu addItemWithTitle:@"兼容取词" action:@selector(toggleCompatibility:) keyEquivalent:@""]; self.compatibilityMenuItem.target=self;
     NSMenuItem *appearance=[menu addItemWithTitle:@"气泡外观" action:NULL keyEquivalent:@""]; appearance.submenu=[self createAppearanceMenu];
     [self addProviderMenu:menu];
@@ -1441,6 +1448,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
 - (EventHotKeyRef *)shortcutReferenceForAction:(NSString *)action {
     if([action isEqual:YiShortcutCapture]) return &_captureHotkey;
     if([action isEqual:YiShortcutSelection]) return &_selectionHotkey;
+    if([action isEqual:YiShortcutAutomatic]) return &_automaticHotkey;
     return &_openHotkey;
 }
 - (void)unregisterShortcutKeys {
@@ -1454,7 +1462,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     BOOL success=YES;
     for(NSString *action in YiShortcutActions()) {
         YiShortcut *shortcut=shortcuts[action];
-        UInt32 number=[action isEqual:YiShortcutCapture] ? 1 : ([action isEqual:YiShortcutSelection] ? 2 : 3);
+        UInt32 number=[action isEqual:YiShortcutCapture] ? 1 : ([action isEqual:YiShortcutSelection] ? 2 : ([action isEqual:YiShortcutAutomatic] ? 4 : 3));
         EventHotKeyID identifier={'Trns',number};
         OSStatus status=RegisterEventHotKey(shortcut.keyCode,shortcut.carbonModifiers,identifier,GetEventDispatcherTarget(),0,[self shortcutReferenceForAction:action]);
         if(status!=noErr) {
@@ -1472,6 +1480,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         if(item.action==@selector(capture:)) action=YiShortcutCapture;
         else if(item.action==@selector(translateSelectedText:)) action=YiShortcutSelection;
         else if(item.action==@selector(showSetup:)) action=YiShortcutOpen;
+        else if(item.action==@selector(toggle:)) action=YiShortcutAutomatic;
         if(!action) continue;
         YiShortcut *shortcut=self.shortcuts[action];
         BOOL registered=*([self shortcutReferenceForAction:action])!=NULL;
@@ -1500,7 +1509,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         self.shortcutPreferences.windowClosed=^{
             AppDelegate *self=weakSelf; if(!self) return;
             self.shortcutsSuspended=NO;
-            if(!self.captureHotkey && !self.selectionHotkey && !self.openHotkey) [self registerShortcutKeys:self.shortcuts strict:NO error:NULL];
+            if(!self.captureHotkey && !self.selectionHotkey && !self.openHotkey && !self.automaticHotkey) [self registerShortcutKeys:self.shortcuts strict:NO error:NULL];
             [self updateShortcutMenuItems]; [self updatePermission];
         };
         [NSApp activateIgnoringOtherApps:YES]; [self.shortcutPreferences showWindow:nil];
@@ -1673,6 +1682,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     self.permissionLabel.stringValue = [NSString stringWithFormat:@"划词权限：%@    截图权限：%@", AXIsProcessTrusted() ? @"已开启" : @"待开启", CGPreflightScreenCaptureAccess() ? @"已开启" : @"待开启"];
     self.statusLabel.stringValue = self.lastStatus ?: @"停止输入后自动翻译，Shift＋回车换行。";
     self.automaticToggle.state = self.started && self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.pauseItem.state=self.started && self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
 }
 - (void)openPermissions:(id)sender {
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@YES});
@@ -1850,7 +1860,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
 - (void)toggle:(id)sender {
     if (!self.started) { [self start]; if (!self.started) { self.lastStatus = @"请先开启 翻译一下的辅助功能权限。"; [self openPermissions:nil]; } }
     else { self.enabled = !self.enabled; if (!self.enabled) [self cancel]; }
-    self.pauseItem.title = self.enabled ? @"暂停自动划词" : @"恢复自动划词"; [self updateStatusIcon]; [self updatePermission];
+    [self updateStatusIcon]; [self updatePermission];
 }
 - (void)preview:(id)sender {
     NSPoint p = self.setupWindow.visible ? NSMakePoint(NSMidX(self.setupWindow.frame),NSMaxY(self.setupWindow.frame)-160) : NSEvent.mouseLocation;

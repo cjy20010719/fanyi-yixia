@@ -5,6 +5,14 @@ int main(void){@autoreleasepool{
     [NSApplication sharedApplication];
     NSDictionary<NSString *,YiShortcut *> *defaults=YiDefaultShortcuts();Check(YiValidateShortcuts(defaults,NULL),"defaults must be complete, valid and distinct");
     Check([defaults[YiShortcutCapture] carbonModifiers]==optionKey && [defaults[YiShortcutCapture] keyCode]==kVK_ANSI_S,"capture default must remain Option S");
+    Check([defaults[YiShortcutAutomatic] carbonModifiers]==optionKey && [defaults[YiShortcutAutomatic] keyCode]==kVK_ANSI_D,"automatic selection default must be Option D");
+    NSMutableDictionary *legacy=[YiShortcutsPropertyList(defaults) mutableCopy];[legacy removeObjectForKey:YiShortcutAutomatic];
+    legacy[YiShortcutCapture]=@{@"keyCode":@(kVK_ANSI_T),@"modifiers":@(NSEventModifierFlagOption)};
+    NSDictionary<NSString *,YiShortcut *> *migrated=YiShortcutsFromPropertyList(legacy);
+    Check([migrated[YiShortcutCapture] keyCode]==kVK_ANSI_T && [migrated[YiShortcutAutomatic] keyCode]==kVK_ANSI_D,"legacy three-action preferences must preserve custom keys and add Option D");
+    legacy[YiShortcutCapture]=@{@"keyCode":@(kVK_ANSI_D),@"modifiers":@(NSEventModifierFlagOption)};
+    migrated=YiShortcutsFromPropertyList(legacy);
+    Check(YiValidateShortcuts(migrated,NULL) && [migrated[YiShortcutCapture] keyCode]==kVK_ANSI_D,"migration must preserve a legacy Option D binding without introducing duplicates");
     Check([defaults[YiShortcutOpen] carbonModifiers]==(optionKey|cmdKey),"open default must include Option and Command");
     Check([YiShortcutsFromPropertyList(YiShortcutsPropertyList(defaults)) isEqual:defaults],"property list must round-trip losslessly");
     Check([YiShortcutsFromPropertyList(@{YiShortcutCapture:@{@"keyCode":@999,@"modifiers":@0}}) isEqual:defaults],"malformed stored settings must recover the complete defaults");

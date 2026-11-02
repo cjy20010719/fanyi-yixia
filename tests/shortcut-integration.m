@@ -58,6 +58,7 @@ static OSStatus FakeUnregister(EventHotKeyRef reference) { [ActiveKeys removeObj
 @property NSUInteger opens;
 @property NSUInteger cancellations;
 @property NSUInteger dismissals;
+@property NSUInteger automaticToggles;
 @end
 @implementation ShortcutDelegateProbe
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {}
@@ -66,7 +67,9 @@ static OSStatus FakeUnregister(EventHotKeyRef reference) { [ActiveKeys removeObj
 - (void)showSetup:(id)sender {self.opens++;}
 - (void)cancel {self.cancellations++;}
 - (void)dismissStatusMenu {self.dismissals++;}
-- (void)updatePermission {}
+- (void)updatePermission {self.pauseItem.state=self.started && self.enabled ? NSControlStateValueOn : NSControlStateValueOff;}
+- (void)updateStatusIcon {}
+- (void)toggle:(id)sender {self.automaticToggles++;[super toggle:sender];}
 @end
 static void Check(BOOL ok,const char *message){if(!ok){fprintf(stderr,"FAIL: %s\n",message);exit(1);}}
 static void Spin(void){NSDate *end=[NSDate dateWithTimeIntervalSinceNow:.06];while(end.timeIntervalSinceNow>0)[NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.005]];}
@@ -75,10 +78,10 @@ static void SetPending(YiShortcutPreferencesController *controller,NSString *act
 static OSStatus SendHotkey(ShortcutDelegateProbe *delegate,UInt32 value,OSType signature){EventRef event=NULL;CreateEvent(NULL,kEventClassKeyboard,kEventHotKeyPressed,0,kEventAttributeNone,&event);EventHotKeyID identifier={signature,value};SetEventParameter(event,kEventParamDirectObject,typeEventHotKeyID,sizeof(identifier),&identifier);OSStatus status=TranslationHotkeyHandler(NULL,event,(__bridge void *)delegate);ReleaseEvent(event);return status;}
 int main(void){@autoreleasepool{
     [ShortcutTestApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-    ActiveKeys=[NSMutableDictionary new];ShortcutDelegateProbe *delegate=[ShortcutDelegateProbe new];delegate.shortcuts=YiDefaultShortcuts();delegate.enabled=YES;
-    NSMenu *menu=[NSMenu new];NSArray *selectors=@[NSStringFromSelector(@selector(showSetup:)),NSStringFromSelector(@selector(translateSelectedText:)),NSStringFromSelector(@selector(capture:))];
-    for(NSString *selector in selectors){NSMenuItem *item=[menu addItemWithTitle:@"fixture" action:NSSelectorFromString(selector) keyEquivalent:@""];item.target=delegate;}delegate.statusMenu=menu;
-    Check([delegate registerShortcutKeys:delegate.shortcuts strict:YES error:NULL] && ActiveKeys.count==3,"startup must register all three default actions");[delegate updateShortcutMenuItems];
+    ActiveKeys=[NSMutableDictionary new];ShortcutDelegateProbe *delegate=[ShortcutDelegateProbe new];delegate.shortcuts=YiDefaultShortcuts();delegate.enabled=YES;delegate.started=YES;
+    NSMenu *menu=[NSMenu new];NSArray *selectors=@[NSStringFromSelector(@selector(showSetup:)),NSStringFromSelector(@selector(translateSelectedText:)),NSStringFromSelector(@selector(capture:)),NSStringFromSelector(@selector(toggle:))];
+    for(NSString *selector in selectors){NSMenuItem *item=[menu addItemWithTitle:@"fixture" action:NSSelectorFromString(selector) keyEquivalent:@""];item.target=delegate;}delegate.statusMenu=menu;delegate.pauseItem=menu.itemArray.lastObject;
+    Check([delegate registerShortcutKeys:delegate.shortcuts strict:YES error:NULL] && ActiveKeys.count==4,"startup must register all three default actions");[delegate updateShortcutMenuItems];
     NSDictionary *original=delegate.shortcuts,*stored=YiShortcutsPropertyList(original);[ShortcutDefaults.standardUserDefaults setObject:stored forKey:@"keyboardShortcuts"];[ShortcutDefaults.standardUserDefaults setObject:@"keep" forKey:@"otherPreference"];
     [delegate showShortcutPreferences:nil];Spin();Check(delegate.shortcutsSuspended && !ActiveKeys.count && delegate.shortcutPreferences,"opening settings must suspend all Carbon keys so existing shortcuts can be recorded");
     SetPending(delegate.shortcutPreferences,YiShortcutCapture,kVK_ANSI_T,NSEventModifierFlagOption);BlockedCode=kVK_ANSI_T;BlockedModifiers=optionKey;
@@ -87,17 +90,20 @@ int main(void){@autoreleasepool{
     Check(!ActiveKeys.count && !delegate.captureHotkey && !delegate.selectionHotkey && !delegate.openHotkey,"registration collision must roll back every temporary registration");
     Check([delegate.shortcuts isEqual:original] && [[ShortcutDefaults.standardUserDefaults objectForKey:@"keyboardShortcuts"] isEqual:stored],"failed Save must not change active model or persisted preferences");
     BlockedCode=UINT32_MAX;[delegate.shortcutPreferences cancel:nil];
-    Check(!delegate.shortcutsSuspended && ActiveKeys.count==3 && [delegate.shortcuts isEqual:original],"Cancel must restore all original global bindings");
+    Check(!delegate.shortcutsSuspended && ActiveKeys.count==4 && [delegate.shortcuts isEqual:original],"Cancel must restore all original global bindings");
     [delegate showShortcutPreferences:nil];Spin();
     SetPending(delegate.shortcutPreferences,YiShortcutOpen,kVK_ANSI_O,NSEventModifierFlagControl|NSEventModifierFlagOption);
     SetPending(delegate.shortcutPreferences,YiShortcutSelection,kVK_ANSI_F,NSEventModifierFlagControl|NSEventModifierFlagOption);
     SetPending(delegate.shortcutPreferences,YiShortcutCapture,kVK_ANSI_D,NSEventModifierFlagControl|NSEventModifierFlagOption);
     NSDictionary<NSString *,YiShortcut *> *candidate=delegate.shortcutPreferences.pendingShortcuts;[delegate.shortcutPreferences save:nil];
-    Check(!delegate.shortcutsSuspended && ActiveKeys.count==3 && [delegate.shortcuts isEqual:candidate],"successful Save must commit all three registrations without duplicate restoration");
+    Check(!delegate.shortcutsSuspended && ActiveKeys.count==4 && [delegate.shortcuts isEqual:candidate],"successful Save must commit all three registrations without duplicate restoration");
     Check([[ShortcutDefaults.standardUserDefaults objectForKey:@"keyboardShortcuts"] isEqual:YiShortcutsPropertyList(candidate)] && [[ShortcutDefaults.standardUserDefaults objectForKey:@"otherPreference"] isEqual:@"keep"],"Save must persist exactly the shortcuts without altering unrelated settings");
-    NSArray *actions=YiShortcutActions();for(NSUInteger i=0;i<3;i++){YiShortcut *shortcut=candidate[actions[i]];NSMenuItem *item=menu.itemArray[i];Check([item.keyEquivalent isEqual:shortcut.keyEquivalent] && item.keyEquivalentModifierMask==shortcut.modifiers,"menu shortcuts must use each current configured chord");Check([item.title isEqual:YiShortcutActionName(actions[i])],"successful registrations must not retain unavailable labels");}
+    NSArray *actions=YiShortcutActions();for(NSUInteger i=0;i<4;i++){YiShortcut *shortcut=candidate[actions[i]];NSMenuItem *item=menu.itemArray[i];Check([item.keyEquivalent isEqual:shortcut.keyEquivalent] && item.keyEquivalentModifierMask==shortcut.modifiers,"menu shortcuts must use each current configured chord");Check([item.title isEqual:YiShortcutActionName(actions[i])],"successful registrations must not retain unavailable labels");}
     NSUInteger cancellations=delegate.cancellations;[delegate handle:Key(kVK_ANSI_D,NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagCapsLock)];Check(delegate.cancellations==cancellations,"configured shortcuts must not be mistaken for translation cancellation");[delegate handle:Key(kVK_ANSI_S,NSEventModifierFlagOption)];Check(delegate.cancellations==cancellations+1,"replaced defaults must no longer bypass ordinary keyboard handling");
-    for(UInt32 value=1;value<=4;value++)Check(SendHotkey(delegate,value,'Trns')==(value<=3?noErr:eventNotHandledErr),"known IDs 1-3 must route and ID 4 must be ignored");Check(SendHotkey(delegate,1,'Nope')==eventNotHandledErr,"foreign hotkey signatures must be ignored");Spin();Check(delegate.captures==1 && delegate.selections==1 && delegate.opens==1,"global hotkey IDs must dispatch to three separate actions exactly once");
+    for(UInt32 value=1;value<=5;value++)Check(SendHotkey(delegate,value,'Trns')==(value<=4?noErr:eventNotHandledErr),"known IDs 1-4 must route and ID 5 must be ignored");Check(SendHotkey(delegate,1,'Nope')==eventNotHandledErr,"foreign hotkey signatures must be ignored");Spin();Check(delegate.captures==1 && delegate.selections==1 && delegate.opens==1,"global hotkey IDs must dispatch to three separate actions exactly once");
+    Check(delegate.automaticToggles==1 && !delegate.enabled && delegate.pauseItem.state==NSControlStateValueOff,"Option D routing must disable automatic selection and clear its checkmark");
+    Check(SendHotkey(delegate,4,'Trns')==noErr,"automatic hotkey must also work while paused");Spin();
+    Check(delegate.automaticToggles==2 && delegate.enabled && delegate.pauseItem.state==NSControlStateValueOn,"second automatic hotkey must restore selection and its checkmark");
     delegate.shortcutsSuspended=YES;Check(SendHotkey(delegate,1,'Trns')==noErr,"registered events may arrive while settings suspend dispatch");Spin();Check(delegate.captures==1,"hotkey dispatch must remain suspended while recording settings");delegate.shortcutsSuspended=NO;
     [delegate unregisterShortcutKeys];Check(!ActiveKeys.count,"termination cleanup must release all three bindings");
     puts("PASS: occupied Save rolls back all registrations without persistence; Cancel restores originals; successful Save commits all3 and updates menus.");

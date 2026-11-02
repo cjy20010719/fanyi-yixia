@@ -2,7 +2,7 @@
 
 macOS 划词、截图与输入翻译应用，支持 macOS 13 及以上版本，提供 Apple Silicon 与 Intel 通用安装包。
 
-[下载 v1.0.0 安装包](https://github.com/cjy20010719/Yi/releases/download/v1.0.0/Yi-1.0.0-universal.dmg) · [发布页面与校验文件](https://github.com/cjy20010719/Yi/releases)
+[下载 v1.0.0 安装包](https://github.com/cjy20010719/fanyi-yixia/releases/download/v1.0.0/Yi-1.0.0-universal.dmg) · [发布页面与校验文件](https://github.com/cjy20010719/fanyi-yixia/releases)
 
 ## 安装
 
@@ -12,7 +12,7 @@ macOS 划词、截图与输入翻译应用，支持 macOS 13 及以上版本，�
 
 - 自动划词翻译、截图本机 OCR 与输入后自动翻译；默认自动识别原文并译成简体中文，支持多语言目标切换。
 - 菜单中的「翻译源」可选择 Google 或有道，自动保存选择。两者均为免密钥接入，可能限流或因接口变化暂时不可用，不承诺无限额度。
-- 默认 Option＋A 翻译选中文字，Option＋S 框选截图，Option＋Command＋A 打开主界面。「快捷键设置…」可自定义。
+- 默认 Option＋A 翻译选中文字，Option＋S 框选截图，Option＋D 开关自动划词，Option＋Command＋A 打开主界面。「快捷键设置…」可自定义。
 - 输入停止约 0.6 秒自动翻译，回车立即翻译，Shift＋回车换行，支持输入法组词。
 - 白色、黑色、浅色玻璃和深色玻璃四种气泡。切换后自动预览；按住复制按钮左侧图标上下拖动可调背景深浅并自动保存。长译文可滚动阅读。
 - 点击菜单栏图标显示或隐藏主窗口，右键打开功能菜单。开启「开机静默启动」后登录时后台启动。
@@ -32,7 +32,7 @@ macOS 划词、截图与输入翻译应用，支持 macOS 13 及以上版本，�
 
 ## 自动更新与发布
 
-Sparkle 2.10.1 使用 GitHub Releases 提供更新 ZIP，GitHub Pages 提供 [签名 appcast](https://cjy20010719.github.io/Yi/appcast.xml)。默认每天检查，用户确认后下载安装；菜单可手动检查或关闭自动检查。更新源和更新包均验证 EdDSA 签名。
+Sparkle 2.10.1 使用 GitHub Releases 提供更新 ZIP，GitHub Pages 提供 [签名 appcast](https://cjy20010719.github.io/fanyi-yixia/appcast.xml)。默认每天检查，用户确认后下载安装；菜单可手动检查或关闭自动检查。更新源和更新包均验证 EdDSA 签名。
 
 当前版本为 1.0.0（构建 100），已经安装同版本的用户需手动替换一次；后续正式版本从 1.0.1 开始递增。临时签名可能导致更新后需要重新授予系统隐私权限。
 

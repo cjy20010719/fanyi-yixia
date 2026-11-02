@@ -6,6 +6,7 @@
 并参考 https://support.apple.com/zh-cn/102445 决定是否允许打开。
 
 Option＋A：翻译选中文字；Option＋S：框选截图；右键或 Esc 取消框选。
+Option＋D：开启或关闭自动划词。
 Option＋Command＋A：打开主窗口。可在「快捷键设置…」修改。
 输入后停止约 0.6 秒自动翻译；回车立即翻译，Shift＋回车换行。
 菜单「翻译源」选择 Google 或有道，选择自动保存。
@@ -19,5 +20,5 @@ Option＋Command＋A：打开主窗口。可在「快捷键设置…」修改。
 同版本不会触发更新；安装相同版本的新安装包需手动替换。
 更新后，macOS 可能要求重新添加辅助功能或屏幕录制授权。
 
-下载：https://github.com/cjy20010719/Yi/releases
-源码：https://github.com/cjy20010719/Yi
+下载：https://github.com/cjy20010719/fanyi-yixia/releases
+源码：https://github.com/cjy20010719/fanyi-yixia

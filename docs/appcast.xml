@@ -3,19 +3,19 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 --><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
     <title>翻译一下更新</title>
-    <link>https://github.com/cjy20010719/Yi</link>
+    <link>https://github.com/cjy20010719/fanyi-yixia</link>
     <description>翻译一下 macOS updates</description>
     <item>
       <title>翻译一下 1.0.0</title>
-      <pubDate>Thu, 29 Oct 2026 13:31:39 GMT</pubDate>
+      <pubDate>Mon, 02 Nov 2026 08:27:00 GMT</pubDate>
       <sparkle:version>100</sparkle:version>
       <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-      <description>翻译一下 1.0.0：Google 与有道翻译源、划词、截图、本机 OCR、自动输入翻译和四种气泡外观。</description>
-      <enclosure sparkle:edSignature="n53deQiTkQULU6IixQqL9Byxom1mUVSaa4M3uT+fdSp9fyCWHXqA82dk4NlP6ovs3VUaErYEBMf2z/vmhc75DA==" url="https://github.com/cjy20010719/Yi/releases/download/v1.0.0/Yi-1.0.0-universal.zip" length="1431100" type="application/octet-stream"></enclosure>
+      <description>新增 Option＋D 开关自动划词；截图框选底部提示改为清晰文字，不显示背景框。版本保持 1.0.0。</description>
+      <enclosure sparkle:edSignature="2Ei8jnRZ2hDstLrP8MsjOG5pvP2ybpIT0PoLTgQwmWLRjxBaZQJ6JA/BuvukC8oF2V7Y96Wu2WbO1wDgrlGPDw==" url="https://github.com/cjy20010719/fanyi-yixia/releases/download/v1.0.0/Yi-1.0.0-universal.zip" length="1432565" type="application/octet-stream"></enclosure>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:
-edSignature: wrL+ti1ADoUwVAbttSn3ZJieK/Ko4LLf+KxHemiPe38TgH0f72J7A3xb4vA7QiXlQwI3s19sft3UPfKnzcDnDw==
-length: 1295
+edSignature: VpBn7rkco7nbdwF4BmoTP5SWASOG3K+rvN35Xk4Di9HbphPtBnbXlLvZ/UjP7AAFXzT1bjHzBZ+LcQ2kZyPPDQ==
+length: 1317
 -->
