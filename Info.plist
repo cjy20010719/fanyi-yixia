@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>100</string>
+	<string>102</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -25,7 +25,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>翻译一下会在你主动截图或显示玻璃气泡时临时读取屏幕，在本机识别文字或模糊背景。截图不会上传或保存。</string>
+	<string>翻译一下会在你截图或显示玻璃气泡时临时读取屏幕。截图仅在本机识别，图片不会保存或上传。</string>
 	<key>SUFeedURL</key>
 	<string>https://cjy20010719.github.io/fanyi-yixia/appcast.xml</string>
 	<key>SUEnableAutomaticChecks</key>

@@ -31,7 +31,7 @@ int main(void) { @autoreleasepool {
     Bubble *bubble=[Bubble new];
     NSScreen *screen=NSScreen.mainScreen ?: NSScreen.screens.firstObject;
     Check(screen!=nil,"bubble style test requires the real display service");
-    NSString *text=@"文档";
+    NSString *text=@"Hello 文档";
     [bubble layoutText:text anchor:NSMakeRect(NSMidX(screen.visibleFrame),NSMidY(screen.visibleFrame),1,18) result:YES display:NO];
     for(NSString *style in @[@"white",@"black",@"light",@"dark",@"black",@"white"]) {
         NSMutableDictionary *fixture=[arguments mutableCopy] ?: [NSMutableDictionary new]; fixture[@"bubbleAppearance"]=style;
@@ -39,12 +39,13 @@ int main(void) { @autoreleasepool {
         BOOL solid=[style isEqual:@"white"] || [style isEqual:@"black"],dark=[style isEqual:@"black"] || [style isEqual:@"dark"];
         Check(bubble.shape.glassAppearance!=solid && bubble.shape.darkAppearance==dark,"four appearance selections must switch light/dark and glass/solid independently");
         Check([bubble.translation isEqual:text] && [bubble.textView.string isEqual:text],"appearance changes must retain the existing translation");
-        Check(NSMaxY(bubble.scroll.frame)<=NSMinY(bubble.languagePicker.frame)-4 && bubble.panel.frame.size.height<=90,"short bubbles must use compact nonoverlapping header/body spacing");
+        Check(NSMaxY(bubble.scroll.frame)<=NSMinY(bubble.languagePicker.frame)-4 && bubble.panel.frame.size.height<=75,"short bubbles must use compact nonoverlapping header/body spacing");
         Check(fabs(NSMinX(bubble.scroll.frame)-NSMinX(bubble.languagePicker.frame))<0.01,"language title and translation must share a left edge");
         NSColor *header=[bubble.languagePicker.contentTintColor colorUsingColorSpace:NSColorSpace.genericRGBColorSpace];
         Check(fabs(header.redComponent-header.greenComponent)<0.01 && fabs(header.greenComponent-header.blueComponent)<0.01,"header and chevron must use neutral colors instead of gold");
         NSFont *bodyFont=[bubble.textView.textStorage attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
-        Check(bodyFont.pointSize==13.0 && bubble.languagePicker.font.pointSize==13 && [bodyFont.fontName containsString:@"Songti"],"all bubble translations must use smaller reference Songti while headers retain their system font");
+        Check([bodyFont.fontName isEqual:[NSFont systemFontOfSize:13 weight:NSFontWeightRegular].fontName] && bodyFont.pointSize == 13 && bubble.languagePicker.font.pointSize==12,
+              "bubble body and header should use system typography");
         Check(bubble.panel.alphaValue==1 && bubble.shape.alphaValue==1 && bubble.textView.alphaValue==1,"translucency must not fade translation or controls");
         NSColor *body=[bubble.foregroundColor colorUsingColorSpace:NSColorSpace.genericRGBColorSpace];
         Check(dark ? body.redComponent>0.8 : body.redComponent<0.4,"foreground must remain readable after dark/light switching");
@@ -64,6 +65,15 @@ int main(void) { @autoreleasepool {
         hit=[bubble.shape hitTest:NSMakePoint(NSMidX(bubble.clipboardButton.frame),NSMidY(bubble.clipboardButton.frame))];
         Check(hit==bubble.clipboardButton || [hit isDescendantOf:bubble.clipboardButton],"background surface must not intercept copy clicks");
     }
+    Check(NSMaxX(bubble.languagePicker.frame) < NSMinX(bubble.swapButton.frame) &&
+          NSMinX(bubble.speechButton.frame) - NSMaxX(bubble.swapButton.frame) == 3 &&
+          NSMinX(bubble.shadeControl.frame) - NSMaxX(bubble.speechButton.frame) == 3 &&
+          NSMinX(bubble.clipboardButton.frame) - NSMaxX(bubble.shadeControl.frame) == 3,
+          "the four bubble controls must form a tight group without overlapping the language picker");
+    NSString *structured = @"# 标题\n\n1. 第一项\n    - 子项\n\n2. 第二项";
+    [bubble layoutText:structured anchor:NSMakeRect(NSMidX(screen.visibleFrame), NSMidY(screen.visibleFrame), 1, 18) result:YES display:NO];
+    Check([bubble.textView.string isEqualToString:structured] && [bubble.translation isEqualToString:structured],
+          "blank lines and list indentation must be identical in the rendered bubble and copied result");
     NSString *longText=[@"这是一段需要完整阅读的长译文，右侧滚动条不能遮挡任何文字。" stringByPaddingToLength:1500 withString:@"请继续阅读全部内容，确认每一行的末字清晰可见。" startingAtIndex:0];
     [bubble layoutText:longText anchor:NSMakeRect(NSMidX(screen.visibleFrame),NSMidY(screen.visibleFrame),1,18) result:YES display:NO];
     Check(bubble.scrollable && bubble.scroll.hasVerticalScroller,"long translations must remain scrollable");
@@ -72,6 +82,19 @@ int main(void) { @autoreleasepool {
     NSRect longTextBounds=[bubble.textView.layoutManager usedRectForTextContainer:bubble.textView.textContainer];
     Check(NSMaxX(longTextBounds)<=bubble.scroll.frame.size.width-17,"long translation glyphs must not overlap the scrollbar");
     Check([bubble.textView.string isEqualToString:longText],"scrollbar spacing must retain the entire translation");
+    NSRect visible = NSInsetRect(screen.visibleFrame, 12, 12);
+    NSRect anchor = NSMakeRect(NSMidX(visible) - 90, NSMaxY(visible) - 170, 180, 20);
+    [bubble layoutText:longText anchor:anchor result:YES display:NO];
+    Check(bubble.shape.pointsDown && NSMinY(bubble.panel.frame) >= NSMaxY(anchor),
+          "long results must use a scrollable bubble above the selection when there is room");
+    Check(fabs(NSMidX(bubble.panel.frame) - NSMidX(anchor)) < 1 &&
+          fabs(NSMinX(bubble.panel.frame) + bubble.shape.arrowX - NSMidX(anchor)) < 1,
+          "the bubble and its pointer must center above the selection");
+    anchor.origin.y = NSMaxY(visible) - anchor.size.height;
+    [bubble layoutText:text anchor:anchor result:YES display:NO];
+    Check(!bubble.shape.pointsDown && NSMaxY(bubble.panel.frame) <= NSMinY(anchor),
+          "a selection at the top of the screen must show the bubble below");
+    [bubble layoutText:longText anchor:NSMakeRect(NSMidX(visible),NSMidY(visible),1,18) result:YES display:NO];
     // Dispatch real AppKit mouse events to the shade control, including dragging
     // outside its bounds, then recreate the bubble to verify saved per-style values.
     id savedLevels=[defaults objectForKey:@"bubbleBackgroundLevels"];

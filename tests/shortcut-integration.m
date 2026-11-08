@@ -21,6 +21,7 @@ static OSStatus FakeUnregister(EventHotKeyRef reference) { [ActiveKeys removeObj
 - (NSDictionary *)dictionaryForKey:(NSString *)key;
 - (BOOL)boolForKey:(NSString *)key;
 - (void)setObject:(id)value forKey:(NSString *)key;
+- (void)removeObjectForKey:(NSString *)key;
 - (void)setBool:(BOOL)value forKey:(NSString *)key;
 @end
 @implementation ShortcutDefaults
@@ -30,6 +31,7 @@ static OSStatus FakeUnregister(EventHotKeyRef reference) { [ActiveKeys removeObj
 - (NSDictionary *)dictionaryForKey:(NSString *)key {return self.values[key];}
 - (BOOL)boolForKey:(NSString *)key {return [self.values[key] boolValue];}
 - (void)setObject:(id)value forKey:(NSString *)key {self.values[key]=value;}
+- (void)removeObjectForKey:(NSString *)key {[self.values removeObjectForKey:key];}
 - (void)setBool:(BOOL)value forKey:(NSString *)key {self.values[key]=@(value);}
 @end
 @interface HiddenShortcutPreferencesController : YiShortcutPreferencesController @end

@@ -13,6 +13,15 @@ static void Spin(double seconds) { NSDate *until=[NSDate dateWithTimeIntervalSin
 static void Change(AutoTestDelegate *d,NSString *text) { d.inputView.string=text; [d textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:d.inputView]]; }
 int main(void) { @autoreleasepool {
  [NSApplication sharedApplication]; AutoTestDelegate *d=[AutoTestDelegate new];d.targetCode=@"zh-CN";[d showSetup:nil];
+ [d updatePermissionIndicatorsWithSelection:YES capture:YES];
+ Require(d.accessPermissionButton.hidden && d.capturePermissionButton.hidden && [d.permissionLabel.stringValue isEqual:@"权限已就绪"],"granted permissions must leave only a short status");
+ [d updatePermissionIndicatorsWithSelection:NO capture:YES];
+ Require(!d.accessPermissionButton.hidden && d.capturePermissionButton.hidden && NSMinX(d.accessPermissionButton.frame)==NSMinX(d.capturePermissionButton.frame),"only missing selection permission must appear, right aligned");
+ [d updatePermissionIndicatorsWithSelection:YES capture:NO];
+ Require(d.accessPermissionButton.hidden && !d.capturePermissionButton.hidden,"only missing capture permission must appear");
+ [d updatePermissionIndicatorsWithSelection:NO capture:NO];
+ Require(!d.accessPermissionButton.hidden && !d.capturePermissionButton.hidden && NSMaxX(d.accessPermissionButton.frame)<NSMinX(d.capturePermissionButton.frame),"both missing permissions must appear without overlap");
+ [d updatePermission];
  Change(d,@"h");Spin(.3);Change(d,@"hello");Spin(.35);Require(d.submissions==0,"typing burst must debounce");Spin(.35);Require(d.submissions==1 && [d.submitted isEqual:@"hello"],"one request for newest text after pause");
  Change(d,@"to delete");Spin(.2);Change(d,@" \n");Spin(.7);Require(d.submissions==1 && !d.outputView.string.length,"clearing input cancels pending translation and result");
  Change(d,@"marked");[d.inputView setMarkedText:@"你好" selectedRange:NSMakeRange(2,0) replacementRange:NSMakeRange(0,6)];Spin(.8);Require(d.submissions==1,"unfinished IME text must never submit");[d.inputView unmarkText];Spin(.8);Require(d.submissions==2,"IME commit must submit after marked text clears");

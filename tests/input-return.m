@@ -7,11 +7,13 @@
 @property NSString *submittedText;
 @property NSUInteger captures;
 @property NSUInteger selectionRequests;
+@property NSUInteger automaticToggles;
 @end
 @implementation ReturnTestDelegate
 - (void)translateInput:(id)sender { self.submissions++; self.submittedText = self.inputView.string; }
 - (void)capture:(id)sender { self.captures++; }
 - (void)translateSelectedText:(id)sender { self.selectionRequests++; }
+- (void)toggle:(id)sender { self.automaticToggles++; }
 @end
 
 static void Require(BOOL condition, const char *message) {
@@ -43,17 +45,17 @@ int main(void) {
         Require(delegate.submissions == 2, "composition confirmation must not submit prematurely");
         [delegate.inputView unmarkText];
         Require(![delegate textView:delegate.outputView doCommandBySelector:@selector(insertNewline:)], "other text views must not submit the source");
-        for (UInt32 value=1; value<=4; value++) {
+        for (UInt32 value=1; value<=5; value++) {
             EventRef event=NULL;
             CreateEvent(NULL,kEventClassKeyboard,kEventHotKeyPressed,0,kEventAttributeNone,&event);
             EventHotKeyID hotkey={'Trns',value};
             SetEventParameter(event,kEventParamDirectObject,typeEventHotKeyID,sizeof(hotkey),&hotkey);
             OSStatus status=TranslationHotkeyHandler(NULL,event,(__bridge void *)delegate);
-            Require(status==(value<=3 ? noErr : eventNotHandledErr), "only the three known hotkey identifiers should be handled");
+            Require(status==(value<=4 ? noErr : eventNotHandledErr), "only the four known hotkey identifiers should be handled");
             ReleaseEvent(event);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            Require(delegate.captures==1 && delegate.selectionRequests==1, "screenshot and selection hotkeys must dispatch to distinct actions exactly once");
+            Require(delegate.captures==1 && delegate.selectionRequests==1 && delegate.automaticToggles==1, "screenshot, selection and automatic-selection hotkeys must dispatch to distinct actions exactly once");
             [delegate.permissionTimer invalidate]; [delegate.setupWindow close];
             puts("PASS: native Return submits, Shift+Return inserts newline, keypad Enter submits, IME composition and other editors do not submit.");
             puts("PASS: Carbon hotkey routing distinguishes screenshot, selection and unknown identifiers.");

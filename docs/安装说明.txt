@@ -1,4 +1,4 @@
-翻译一下 1.0.0 — macOS 划词与截图翻译
+翻译一下 1.0.1 — macOS 划词与截图翻译
 
 支持 macOS 13+，通用版本包含 Apple Silicon 和 Intel 架构。
 打开 DMG，将「翻译一下.app」拖入 Applications，再从应用程序启动。

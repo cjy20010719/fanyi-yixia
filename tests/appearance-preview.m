@@ -15,6 +15,12 @@ int main(void){@autoreleasepool{
     @try {
         AppearanceTestDelegate *delegate=[AppearanceTestDelegate new];delegate.bubble=[Bubble new];delegate.targetCode=@"zh-CN";
         NSMenu *menu=[delegate createAppearanceMenu];[delegate createAppearanceMenu];
+        [defaults setObject:@"system" forKey:@"bubbleAppearance"];
+        [delegate updateBubbleAppearance];
+        Check([delegate.bubble.appearanceKey isEqual:@"light"],"removed appearance must fall back to light glass");
+        NSUInteger styleCount=0;
+        for (NSMenuItem *item in menu.itemArray) if (!item.separatorItem) styleCount++;
+        Check(styleCount==4,"only the four remaining styles should be offered");
         NSUInteger count=0;
         for(NSString *key in @[@"white",@"black",@"light",@"dark"]) {
             NSMenuItem *choice=nil;for(NSMenuItem *item in menu.itemArray) if([item.representedObject isEqual:key]) choice=item;
@@ -24,6 +30,8 @@ int main(void){@autoreleasepool{
             [delegate showPendingAppearancePreview];Check(delegate.previews==count,"open menu must not be disrupted by a preview");
             delegate.statusMenuOpen=NO;[delegate showPendingAppearancePreview];count++;
             Check(delegate.previews==count && delegate.bubble.panel.visible && [delegate.activeContext isEqual:@"preview"],"choosing any appearance must automatically replace the visible preview after menu closes");
+            NSFont *bodyFont=[delegate.bubble.textView.textStorage attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
+            Check(bodyFont.pointSize == 13,"preview should use the chat-style system font");
             BOOL glass=[key isEqual:@"light"] || [key isEqual:@"dark"];
             BOOL dark=[key isEqual:@"black"] || [key isEqual:@"dark"];
             Check(delegate.bubble.shape.glassAppearance==glass && delegate.bubble.shape.darkAppearance==dark,"preview must use the selected solid/glass and light/dark combination");

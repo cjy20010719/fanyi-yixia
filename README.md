@@ -2,7 +2,7 @@
 
 macOS 划词、截图与输入翻译应用，支持 macOS 13 及以上版本，提供 Apple Silicon 与 Intel 通用安装包。
 
-[下载 v1.0.0 安装包](https://github.com/cjy20010719/fanyi-yixia/releases/download/v1.0.0/Yi-1.0.0-universal.dmg) · [发布页面与校验文件](https://github.com/cjy20010719/fanyi-yixia/releases)
+[下载 v1.0.1 安装包](https://github.com/cjy20010719/fanyi-yixia/releases/download/v1.0.1/Yi-1.0.1-universal.dmg) · [发布页面与校验文件](https://github.com/cjy20010719/fanyi-yixia/releases)
 
 ## 安装
 
@@ -34,12 +34,12 @@ macOS 划词、截图与输入翻译应用，支持 macOS 13 及以上版本，�
 
 Sparkle 2.10.1 使用 GitHub Releases 提供更新 ZIP，GitHub Pages 提供 [签名 appcast](https://cjy20010719.github.io/fanyi-yixia/appcast.xml)。默认每天检查，用户确认后下载安装；菜单可手动检查或关闭自动检查。更新源和更新包均验证 EdDSA 签名。
 
-当前版本为 1.0.0（构建 100），已经安装同版本的用户需手动替换一次；后续正式版本从 1.0.1 开始递增。临时签名可能导致更新后需要重新授予系统隐私权限。
+当前版本为 1.0.1（构建 102）。已安装 1.0.0 的用户可从菜单栏检查更新。临时签名可能导致更新后需要重新授予系统隐私权限。
 
 后续在持有原 EdDSA 私钥并已登录 GitHub 的 Mac 上，提交代码与新版本说明后运行：
 
 ```sh
-zsh scripts/release.sh 1.0.1 docs/release-v1.0.1.md
+zsh scripts/release.sh 1.0.2 docs/release-v1.0.2.md
 ```
 
 私钥保存在仓库外，不进入源码、GitHub、CI、安装包或日志。GitHub Actions 仅构建和验证应用，发布签名在本机执行。详见 [发布维护说明](docs/发布维护.md)。

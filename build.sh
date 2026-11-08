@@ -15,7 +15,7 @@ for architecture in "${architectures[@]}"; do
 done
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 ditto "$sparkle_path/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
-clang -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-unused-parameter -Wno-incompatible-pointer-types "${architecture_flags[@]}" -mmacosx-version-min=13.0 -isysroot "$sdk_path" Sources/main.m -o "$APP/Contents/MacOS/翻译一下" -framework Cocoa -framework ApplicationServices -framework Vision -framework Carbon -framework NaturalLanguage -framework ServiceManagement -framework ScreenCaptureKit -framework CoreImage -F "$sparkle_path" -framework Sparkle -Wl,-rpath,@executable_path/../Frameworks
+clang -fobjc-arc -fblocks -O2 -Wall -Wextra -Wno-unused-parameter -Wno-incompatible-pointer-types "${architecture_flags[@]}" -mmacosx-version-min=13.0 -isysroot "$sdk_path" Sources/main.m -o "$APP/Contents/MacOS/翻译一下" -framework Cocoa -framework ApplicationServices -framework Vision -framework Carbon -framework NaturalLanguage -framework ServiceManagement -framework ScreenCaptureKit -framework CoreImage -framework AVFAudio -F "$sparkle_path" -framework Sparkle -Wl,-rpath,@executable_path/../Frameworks
 cp Info.plist "$APP/Contents/Info.plist"
 cp Assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp Assets/MenuBarIcon.png "$APP/Contents/Resources/MenuBarIcon.png"

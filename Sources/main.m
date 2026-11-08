@@ -9,6 +9,7 @@
 #import <CoreImage/CoreImage.h>
 #import "ShortcutPreferences.h"
 #import "YoudaoWeb.h"
+#import "SpeechPlayback.h"
 
 static NSString * const BundleID = @"local.chenshanglong.Translate";
 static NSArray<NSArray<NSString *> *> *Languages(void) {
@@ -25,7 +26,7 @@ typedef void (^TranslationCompletion)(NSString *, NSError *);
 
 static NSError *TranslationError(NSInteger status) {
     NSString *message;
-    if (status == 429) message = @"Google 翻译请求过多，请稍后重试。";
+    if (status == 429) message = @"Google 暂时限流。可在“翻译源”切换有道，或稍后再试。";
     else if (status == 403) message = @"Google 翻译拒绝了请求，请稍后重试。";
     else if (status >= 500) message = @"Google 翻译服务暂时不可用，请稍后重试。";
     else message = @"Google 翻译没有返回有效译文，请稍后重试。";
@@ -38,10 +39,64 @@ static NSString *TranslationFailureMessage(NSError *error) {
     return error.localizedDescription ?: @"翻译失败，请稍后重试。";
 }
 
-static NSString *BubbleDisplayText(NSString *text) {
-    // Paragraph spacing is supplied by TextKit; duplicate blank lines otherwise
-    // produce excessive gaps in a compact reading card. Copy keeps the original.
-    return [text stringByReplacingOccurrencesOfString:@"\\n[ \\t]*\\n+" withString:@"\n" options:NSRegularExpressionSearch range:NSMakeRange(0, text.length)];
+static NSArray<NSString *> *TranslationLines(NSString *text) {
+    return [[text stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"]
+            componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+}
+
+static NSString *MatchSourceLayout(NSString *source, NSString *translation) {
+    if ([source rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location == NSNotFound) return translation;
+
+    NSCharacterSet *space = NSCharacterSet.whitespaceCharacterSet;
+    NSArray<NSString *> *sourceLines = TranslationLines(source);
+    NSMutableArray<NSString *> *translatedLines = [NSMutableArray new];
+    for (NSString *line in TranslationLines(translation)) {
+        NSString *content = [line stringByTrimmingCharactersInSet:space];
+        if (content.length) [translatedLines addObject:content];
+    }
+    NSCharacterSet *nonSpace = space.invertedSet;
+    NSUInteger contentCount = 0;
+    for (NSString *line in sourceLines) {
+        if ([line rangeOfCharacterFromSet:nonSpace].location != NSNotFound) contentCount++;
+    }
+    // A provider can merge or split lines. Only transfer layout when the
+    // returned lines can be paired in order without guessing a split.
+    if (contentCount != translatedLines.count) return translation;
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithCapacity:sourceLines.count];
+    NSUInteger index = 0;
+    for (NSString *line in sourceLines) {
+        NSUInteger firstText = [line rangeOfCharacterFromSet:nonSpace].location;
+        if (firstText == NSNotFound) {
+            [lines addObject:line];
+        } else {
+            [lines addObject:[[line substringToIndex:firstText] stringByAppendingString:translatedLines[index++]]];
+        }
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+static BOOL HasEdgeLineBreak(NSString *text, NSStringCompareOptions direction) {
+    if (!text.length) return NO;
+    NSCharacterSet *nonSpace = NSCharacterSet.whitespaceAndNewlineCharacterSet.invertedSet;
+    NSRange boundary = [text rangeOfCharacterFromSet:nonSpace options:direction];
+    NSRange edge = NSMakeRange(0, text.length);
+    if (boundary.location != NSNotFound) {
+        NSUInteger end = NSMaxRange(boundary);
+        edge = direction == NSBackwardsSearch ? NSMakeRange(end, text.length - end) : NSMakeRange(0, boundary.location);
+    }
+    return [text rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet options:0 range:edge].location != NSNotFound;
+}
+
+static void AppendGoogleSegment(NSMutableString *result, id translated, id original, BOOL *previousLineBreak) {
+    if (![translated isKindOfClass:NSString.class]) return;
+    NSString *source = [original isKindOfClass:NSString.class] ? original : nil;
+    if (result.length && (*previousLineBreak || HasEdgeLineBreak(source, 0)) &&
+        !HasEdgeLineBreak(result, NSBackwardsSearch) && !HasEdgeLineBreak(translated, 0)) {
+        [result appendString:@"\n"];
+    }
+    [result appendString:translated];
+    *previousLineBreak = HasEdgeLineBreak(source, NSBackwardsSearch);
 }
 
 @interface Translator : NSObject
@@ -53,7 +108,16 @@ static NSString *BubbleDisplayText(NSString *text) {
 @property NSString *provider;
 @property NSDictionary *youdaoKeys;
 @property NSDate *youdaoKeyDate;
+@property NSDate *youdaoRetryDate;
+@property NSTimeInterval nextYoudaoRequest;
+@property NSMutableArray<NSDictionary *> *googleQueue;
+@property BOOL googleBusy;
+@property NSTimeInterval nextGoogleRequest;
+@property (copy) dispatch_block_t googlePump;
+@property NSDate *googleRetryDate;
+@property NSUInteger googleLimitCount;
 - (void)translate:(NSString *)text completion:(TranslationCompletion)completion;
+- (void)raw:(NSString *)text source:(NSString *)source completion:(TranslationCompletion)completion;
 - (void)cancel;
 @end
 
@@ -67,54 +131,168 @@ static NSString *BubbleDisplayText(NSString *text) {
         _session = [NSURLSession sessionWithConfiguration:config];
         _cache = [NSCache new]; _cache.countLimit = 150;
         _tasks = [NSMutableSet new]; _targetLanguage = @"zh-CN";
+        _googleQueue=[NSMutableArray new];
+        id retry=[NSUserDefaults.standardUserDefaults objectForKey:@"googleRetryDate"];
+        if([retry isKindOfClass:NSDate.class] && [retry timeIntervalSinceNow]>0) _googleRetryDate=retry;
         _provider=[NSUserDefaults.standardUserDefaults stringForKey:@"translationProvider"] ?: @"google";
     }
     return self;
 }
-- (void)cancel { self.epoch++; for (NSURLSessionDataTask *task in self.tasks) [task cancel]; [self.tasks removeAllObjects]; }
+- (void)cancel {
+    self.epoch++;
+    if(self.googlePump) dispatch_block_cancel(self.googlePump);self.googlePump=nil;
+    NSArray *queued=self.googleQueue.copy;[self.googleQueue removeAllObjects];
+    for(NSDictionary *job in queued) {dispatch_block_t cancel=job[@"cancel"];cancel();}
+    for (NSURLSessionDataTask *task in self.tasks) [task cancel]; [self.tasks removeAllObjects];
+}
+- (NSError *)googleCooldownError {
+    NSTimeInterval remaining=self.googleRetryDate.timeIntervalSinceNow;
+    if(remaining<=0) return nil;
+    NSString *message=[NSString stringWithFormat:@"Google 暂时限流，约 %.0f 秒后可重试。可在“翻译源”切换有道。",ceil(remaining)];
+    return [NSError errorWithDomain:BundleID code:429 userInfo:@{NSLocalizedDescriptionKey:message}];
+}
+- (void)recordGoogleLimit:(NSHTTPURLResponse *)response {
+    self.googleLimitCount=MIN(self.googleLimitCount+1,4u);
+    NSTimeInterval delay=MIN(120*pow(2,self.googleLimitCount-1),900);
+    NSString *header=[response valueForHTTPHeaderField:@"Retry-After"];
+    if(header.length) {
+        NSTimeInterval seconds=header.doubleValue;
+        if(seconds<=0) {
+            NSDateFormatter *format=[NSDateFormatter new];format.locale=[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+            format.dateFormat=@"EEE, dd MMM yyyy HH:mm:ss zzz";
+            seconds=[[format dateFromString:header] timeIntervalSinceNow];
+        }
+        delay=MAX(delay,seconds);
+    }
+    self.googleRetryDate=[NSDate dateWithTimeIntervalSinceNow:delay];
+    [NSUserDefaults.standardUserDefaults setObject:self.googleRetryDate forKey:@"googleRetryDate"];
+}
+- (void)pumpGoogleRequests {
+    if(self.googleBusy || self.googlePump || !self.googleQueue.count) return;
+    NSTimeInterval delay=MAX(0,self.nextGoogleRequest-NSProcessInfo.processInfo.systemUptime);
+    __weak Translator *weakSelf=self;
+    self.googlePump=dispatch_block_create(0,^{
+        Translator *self=weakSelf;if(!self) return;
+        self.googlePump=nil;
+        if(!self.googleQueue.count) return;
+        NSDictionary *job=self.googleQueue.firstObject;[self.googleQueue removeObjectAtIndex:0];
+        self.googleBusy=YES;dispatch_block_t run=job[@"run"];run();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),dispatch_get_main_queue(),self.googlePump);
+}
 - (void)youdaoRequest:(NSURLRequest *)request completion:(void (^)(NSData *, NSError *))completion {
+    NSUInteger epoch=self.epoch;
+    NSTimeInterval delay=MAX(0,self.nextYoudaoRequest-NSProcessInfo.processInfo.systemUptime);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+        if(epoch!=self.epoch) {completion(nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);return;}
+        NSTimeInterval remaining=self.youdaoRetryDate.timeIntervalSinceNow;
+        if(remaining>0) {completion(nil,YoudaoResponseError(429,[NSString stringWithFormat:@"有道暂时限流，约 %.0f 秒后可重试。",ceil(remaining)]));return;}
+        self.nextYoudaoRequest=NSProcessInfo.processInfo.systemUptime+0.4;
+        [self sendYoudaoRequest:request completion:completion];
+    });
+}
+- (void)sendYoudaoRequest:(NSURLRequest *)request completion:(void (^)(NSData *, NSError *))completion {
     NSUInteger epoch=self.epoch; __block __weak NSURLSessionDataTask *weakTask;
     NSURLSessionDataTask *task=[self.session dataTaskWithRequest:request completionHandler:^(NSData *data,NSURLResponse *response,NSError *error) {
         NSInteger status=[response isKindOfClass:NSHTTPURLResponse.class] ? [(NSHTTPURLResponse *)response statusCode] : 0;
         dispatch_async(dispatch_get_main_queue(), ^{
             if(weakTask) [self.tasks removeObject:weakTask];
+            if(status==429) {
+                NSTimeInterval retry=[[(NSHTTPURLResponse *)response valueForHTTPHeaderField:@"Retry-After"] doubleValue];
+                self.youdaoRetryDate=[NSDate dateWithTimeIntervalSinceNow:MAX(120,retry)];
+            }
             if(epoch!=self.epoch) {completion(nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);return;}
-            if(error) {completion(nil,YoudaoError(@"无法连接到有道翻译，请检查网络后重试。"));return;}
-            if(status!=200) {completion(nil,YoudaoError(status==429 ? @"有道请求过多，请稍后重试。" : @"有道网页版暂时不可用，请稍后重试或切换翻译源。"));return;}
+            if(error) {
+                if(error.code==NSURLErrorCancelled) {completion(nil,error);return;}
+                completion(nil,YoudaoResponseError(error.code,error.code==NSURLErrorTimedOut ? @"连接有道翻译超时，请稍后重试。" : @"无法连接到有道翻译，请检查当前网络或代理后重试。"));return;
+            }
+            if(status!=200) {completion(nil,YoudaoResponseError(status,status==429 ? @"有道暂时限流，请稍后重试。" : [NSString stringWithFormat:@"有道服务返回 HTTP %ld，请稍后重试。",(long)status]));return;}
             completion(data,nil);
         });
     }];weakTask=task;[self.tasks addObject:task];[task resume];
 }
 - (void)youdao:(NSString *)text source:(NSString *)source completion:(TranslationCompletion)completion {
+    [self youdao:text source:source refresh:NO completion:completion];
+}
+- (void)youdao:(NSString *)text source:(NSString *)source refresh:(BOOL)refresh completion:(TranslationCompletion)completion {
     NSString *target=YoudaoLanguage(self.targetLanguage);
+    NSUInteger epoch=self.epoch;
     void (^translate)(NSDictionary *)=^(NSDictionary *keys) {
         NSMutableDictionary *params=YoudaoParameters(keys[@"secretKey"],@"webfanyi");
         params[@"i"]=text;params[@"from"]=YoudaoLanguage(source);params[@"to"]=target;params[@"dictResult"]=@"false";
         [self youdaoRequest:YoudaoRequest(params,YES) completion:^(NSData *data,NSError *error) {
-            NSString *result=error ? nil : YoudaoDecode(data,keys);
-            if(!result) self.youdaoKeys=nil;
-            completion(result,error ?: (result ? nil : YoudaoError(nil)));
+            if(epoch!=self.epoch) {completion(nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);return;}
+            NSError *decodeError=nil;
+            NSString *result=error ? nil : YoudaoDecodeResult(data, keys, text, &decodeError);
+            if(!result && self.youdaoKeys==keys && !YoudaoUnsupportedLanguage(decodeError)) {
+                self.youdaoKeys=nil;
+                self.youdaoKeyDate=nil;
+            }
+            // Refresh a bad encryption key once. Never loop on denial, rate limit,
+            // connection failure, cancellation, or an upstream business error.
+            if(!error && [decodeError.domain isEqual:@"Translation.Youdao.Decode"] && !refresh) {
+                [self youdao:text source:source refresh:YES completion:completion];return;
+            }
+            completion(result,error ?: decodeError);
         }];
     };
-    if(self.youdaoKeys && -self.youdaoKeyDate.timeIntervalSinceNow<600) {translate(self.youdaoKeys);return;}
+    // The same web session can reuse a recently issued key across selections.
+    // Cancellation still invalidates the request, not the session key.
+    NSTimeInterval keyAge = -self.youdaoKeyDate.timeIntervalSinceNow;
+    if (!refresh && self.youdaoKeys && self.youdaoKeyDate && keyAge >= 0 && keyAge < 30) {
+        translate(self.youdaoKeys);
+        return;
+    }
     [self youdaoRequest:YoudaoRequest(YoudaoParameters(@"asdjnjfenknafdfsdfsd",@"webfanyi-key-getter"),NO) completion:^(NSData *data,NSError *error) {
         if(error) {completion(nil,error);return;}
         id json=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSDictionary *keys=[json isKindOfClass:NSDictionary.class] && [json[@"data"] isKindOfClass:NSDictionary.class] ? json[@"data"] : nil;
-        for(NSString *field in @[@"secretKey",@"aesKey",@"aesIv"]) if(![keys[field] isKindOfClass:NSString.class] || ![keys[field] length]) {completion(nil,YoudaoError(nil));return;}
+        if(![json isKindOfClass:NSDictionary.class] || ![json[@"code"] respondsToSelector:@selector(integerValue)]) {completion(nil,YoudaoError(@"有道动态密钥响应异常，请稍后重试。"));return;}
+        NSInteger code=[json[@"code"] integerValue];
+        if(code!=0) {completion(nil,YoudaoResponseError(code,[NSString stringWithFormat:@"有道未能提供动态密钥（代码 %ld），请稍后重试。",(long)code]));return;}
+        NSDictionary *keys=[json[@"data"] isKindOfClass:NSDictionary.class] ? json[@"data"] : nil;
+        for(NSString *field in @[@"secretKey",@"aesKey",@"aesIv"]) if(![keys[field] isKindOfClass:NSString.class] || ![keys[field] length]) {completion(nil,YoudaoError(@"有道返回的动态密钥不完整，请稍后重试。"));return;}
         self.youdaoKeys=keys;self.youdaoKeyDate=NSDate.date;translate(keys);
     }];
 }
 - (void)raw:(NSString *)text source:(NSString *)source completion:(TranslationCompletion)completion {
-    if([self.provider isEqual:@"youdao"]) {[self youdao:text source:source completion:completion];return;}
+    if([self.provider isEqual:@"youdao"]) {
+        NSString *key=[NSString stringWithFormat:@"raw-youdao\n%@\n%@\n%@",source,self.targetLanguage,text];
+        NSString *hit=[self.cache objectForKey:key];if(hit) {completion(hit,nil);return;}
+        [self youdao:text source:source completion:^(NSString *result,NSError *error) {
+            if(result.length && !error) [self.cache setObject:result forKey:key];completion(result,error);
+        }];return;
+    }
+    NSString *key=[NSString stringWithFormat:@"raw-google\n%@\n%@\n%@",source,self.targetLanguage,text];
+    NSString *cached=[self.cache objectForKey:key];
+    if(cached) {completion(cached,nil);return;}
+    NSError *cooldown=[self googleCooldownError];if(cooldown) {completion(nil,cooldown);return;}
+    NSUInteger epoch=self.epoch;NSString *target=self.targetLanguage;
+    TranslationCompletion finish=^(NSString *result,NSError *error) {
+        if(result.length && !error) [self.cache setObject:result forKey:key];
+        self.googleBusy=NO;completion(result,error);[self pumpGoogleRequests];
+    };
+    [self.googleQueue addObject:@{@"run":[^{
+        if(epoch!=self.epoch) {finish(nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);return;}
+        NSError *limit=[self googleCooldownError];if(limit) {finish(nil,limit);return;}
+        // Recheck after queuing: an identical preceding request may now be cached.
+        NSString *hit=[self.cache objectForKey:key];if(hit) {finish(hit,nil);return;}
+        self.nextGoogleRequest=NSProcessInfo.processInfo.systemUptime+1.0;
+        [self sendGoogle:text source:source target:target completion:finish];
+    } copy],@"cancel":[^{completion(nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);} copy]}];
+    [self pumpGoogleRequests];
+}
+- (void)sendGoogle:(NSString *)text source:(NSString *)source target:(NSString *)target completion:(TranslationCompletion)completion {
     NSUInteger epoch = self.epoch;
-    NSURLComponents *url = [NSURLComponents componentsWithString:@"https://translate.googleapis.com/translate_a/single"];
+    // Use the Google Translate web entry point used by Easydict, rather than
+    // the separate googleapis GTX host. Keep one endpoint; do not rotate hosts
+    // or retry through another route when Google returns a rate limit.
+    NSURLComponents *url = [NSURLComponents componentsWithString:@"https://translate.google.com/translate_a/single"];
     NSMutableArray *items = [NSMutableArray new];
-    NSDictionary *params = @{@"client":@"gtx", @"sl":source, @"tl":self.targetLanguage, @"dt":@"t", @"q":text};
-    for (NSString *key in params) [items addObject:[NSURLQueryItem queryItemWithName:key value:params[key]]];
+    NSDictionary *params = @{@"client":@"gtx", @"sl":source, @"tl":target, @"dt":@"t", @"dj":@"1", @"ie":@"UTF-8", @"q":text};
+    for (NSString *key in [[params allKeys] sortedArrayUsingSelector:@selector(compare:)]) [items addObject:[NSURLQueryItem queryItemWithName:key value:params[key]]];
     url.queryItems = items;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url.URL];
-    [request setValue:@"Yi/2.0" forHTTPHeaderField:@"User-Agent"];
+    [request setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36" forHTTPHeaderField:@"User-Agent"];
     // The task set owns running tasks; a weak reference prevents a task/block cycle.
     __block __weak NSURLSessionDataTask *weakTask;
     NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -122,16 +300,29 @@ static NSString *BubbleDisplayText(NSString *text) {
         NSInteger status=[response isKindOfClass:NSHTTPURLResponse.class] ? [(NSHTTPURLResponse *)response statusCode] : 0;
         if (!error && status == 200 && data.length) {
             id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            BOOL previousLineBreak = NO;
+            if([root isKindOfClass:NSDictionary.class] && [root[@"sentences"] isKindOfClass:NSArray.class]) {
+                for(id sentence in root[@"sentences"]) {
+                    if ([sentence isKindOfClass:NSDictionary.class]) {
+                        AppendGoogleSegment(result, sentence[@"trans"], sentence[@"orig"], &previousLineBreak);
+                    }
+                }
+            }
             if ([root isKindOfClass:NSArray.class] && [root count] && [root[0] isKindOfClass:NSArray.class]) {
                 for (id segment in root[0]) {
-                    if ([segment isKindOfClass:NSArray.class] && [segment count] && [segment[0] isKindOfClass:NSString.class]) [result appendString:segment[0]];
+                    if ([segment isKindOfClass:NSArray.class] && [segment count]) {
+                        AppendGoogleSegment(result, segment[0], [segment count] > 1 ? segment[1] : nil, &previousLineBreak);
+                    }
                 }
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (weakTask) [self.tasks removeObject:weakTask];
+            // Even a response superseded by a new selection must stop further traffic.
+            if(status==429) [self recordGoogleLimit:(NSHTTPURLResponse *)response];
             if (epoch != self.epoch) { completion(nil, [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]); return; }
-            completion(result.length ? result : nil, error ?: (result.length ? nil : TranslationError(status)));
+            if(result.length) {self.googleLimitCount=0;self.googleRetryDate=nil;[NSUserDefaults.standardUserDefaults removeObjectForKey:@"googleRetryDate"];}
+            completion(result.length ? result : nil, error ?: (result.length ? nil : ([self googleCooldownError] ?: TranslationError(status))));
         });
     }];
     weakTask = task;
@@ -143,9 +334,27 @@ static NSString *BubbleDisplayText(NSString *text) {
 // language guess, keeping the entire phrase together instead of splitting names.
 - (void)contextual:(NSString *)text source:(NSString *)source completion:(TranslationCompletion)completion {
     [self raw:text source:source completion:^(NSString *result, NSError *error) {
+        BOOL autoSource = [source isEqualToString:@"auto"];
+        if (YoudaoUnsupportedLanguage(error)) {
+            if (!autoSource) {
+                [self raw:text source:@"auto" completion:completion];
+                return;
+            }
+            NSString *detected = [NLLanguageRecognizer dominantLanguageForString:text];
+            if ([detected isEqualToString:NLLanguageSimplifiedChinese]) detected = @"zh-CN";
+            if ([detected isEqualToString:NLLanguageTraditionalChinese]) detected = @"zh-TW";
+            for (NSArray<NSString *> *language in Languages()) {
+                if ([language[0] isEqualToString:detected] && ![detected isEqualToString:self.targetLanguage]) {
+                    [self raw:text source:detected completion:completion];
+                    return;
+                }
+            }
+            completion(nil, error);
+            return;
+        }
         NSString *trimmed = [result stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         BOOL unchanged = trimmed && [trimmed caseInsensitiveCompare:[text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]] == NSOrderedSame;
-        if (error || !unchanged || ![source isEqual:@"auto"] || ![self.targetLanguage isEqual:@"zh-CN"]) { completion(result, error); return; }
+        if (error || !unchanged || !autoSource || ![self.targetLanguage isEqual:@"zh-CN"]) { completion(result, error); return; }
         NSString *language = [NLLanguageRecognizer dominantLanguageForString:text];
         BOOL latinOnly = [text rangeOfString:@"\\p{Latin}" options:NSRegularExpressionSearch].location != NSNotFound && [text rangeOfString:@"[\\p{Han}\\p{Hangul}\\p{Hiragana}\\p{Katakana}\\p{Cyrillic}\\p{Arabic}]" options:NSRegularExpressionSearch].location == NSNotFound;
         if (latinOnly && (!language || [language hasPrefix:@"zh"] || [language isEqual:@"und"])) language = @"en";
@@ -198,6 +407,14 @@ static NSString *BubbleDisplayText(NSString *text) {
     NSRange range = matches[index].range;
     NSString *part = [text substringWithRange:range];
     [self contextual:part source:rule[1] completion:^(NSString *translated, NSError *error) {
+        if (YoudaoUnsupportedLanguage(error)) {
+            // Keep this span verbatim and continue translating the other spans.
+            [self repairMatches:matches index:index - 1 rule:rule rules:rules ruleIndex:ruleIndex
+                           text:text remaining:remaining - 1 completion:^(NSString *partial, NSError *laterError) {
+                completion(partial, laterError ?: error);
+            }];
+            return;
+        }
         if (error) { completion(nil, error); return; }
         NSString *updated = translated.length ? [text stringByReplacingCharactersInRange:range withString:translated] : text;
         [self repairMatches:matches index:index - 1 rule:rule rules:rules ruleIndex:ruleIndex text:updated remaining:remaining - 1 completion:completion];
@@ -209,13 +426,15 @@ static NSString *BubbleDisplayText(NSString *text) {
     NSString *cached = [self.cache objectForKey:cacheKey];
     if (cached) { completion(cached, nil); return; }
     void (^finish)(NSString *, NSError *) = ^(NSString *final, NSError *error) {
+        if (error && [final isEqualToString:text]) final = nil;
         if (final) {
             if ([target isEqual:@"zh-CN"]) final = [final stringByApplyingTransform:@"Traditional-Simplified" reverse:NO] ?: final;
-            [self.cache setObject:final forKey:cacheKey];
+            final = MatchSourceLayout(text, final);
+            if (!error) [self.cache setObject:final forKey:cacheKey];
         }
         completion(final, error);
     };
-    if (![target isEqual:@"zh-CN"]) { [self raw:text source:@"auto" completion:finish]; return; }
+    if (![target isEqual:@"zh-CN"]) { [self contextual:text source:@"auto" completion:finish]; return; }
     // One dominant-language guess can silently drop a Chinese clause or
     // transliterate an embedded Korean/Arabic word. For mixed scripts, translate
     // the original spans first, preserving all original Chinese and punctuation.
@@ -244,13 +463,67 @@ static id Attribute(AXUIElementRef element, CFStringRef name) {
 @end
 @implementation Selection @end
 
+static NSRect SelectionAnchorAtPoint(NSPoint point) {
+    return NSMakeRect(point.x, point.y, 1, 18);
+}
+
+static NSRect SelectionAnchorForDrag(NSPoint start, NSPoint end) {
+    return NSMakeRect(MIN(start.x, end.x), MIN(start.y, end.y),
+                      MAX(1, fabs(start.x - end.x)), fabs(start.y - end.y) + 18);
+}
+
+static NSRect TextAnchorFromAX(id value, NSRect drag) {
+    CGRect rect;
+    if (!value || CFGetTypeID((__bridge CFTypeRef)value) != AXValueGetTypeID() ||
+        !AXValueGetValue((__bridge AXValueRef)value, kAXValueCGRectType, &rect) ||
+        rect.size.width <= 0 || rect.size.height <= 0 ||
+        !isfinite(CGRectGetMaxX(rect)) || !isfinite(CGRectGetMaxY(rect)) ||
+        !isfinite(rect.origin.x) || !isfinite(rect.origin.y)) return NSZeroRect;
+
+    CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
+    NSRect anchor = NSMakeRect(rect.origin.x, top - CGRectGetMaxY(rect), rect.size.width, rect.size.height);
+    // A web editor may expose text via an off-canvas element. Its bounds must
+    // still agree with the rows and endpoints that the user actually dragged.
+    const CGFloat tolerance = 48;
+    if (!NSIsEmptyRect(drag) &&
+        (fabs(NSMinY(anchor) - NSMinY(drag)) > tolerance ||
+         fabs(NSMaxY(anchor) - NSMaxY(drag)) > tolerance ||
+         NSMinX(drag) < NSMinX(anchor) - tolerance ||
+         NSMaxX(drag) > NSMaxX(anchor) + tolerance)) return NSZeroRect;
+    return anchor;
+}
+
+static BOOL IsStandaloneWebLink(NSString *text) {
+    // A browser may expose its address without the scheme or with surrounding quotes.
+    static NSDataDetector *detector;
+    static NSCharacterSet *wrappers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        detector = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:NULL];
+        NSMutableCharacterSet *ignored = NSCharacterSet.whitespaceAndNewlineCharacterSet.mutableCopy;
+        [ignored addCharactersInString:@"<>()[]{}\"'“”‘’《》〈〉「」『』（）【】。！？；，、.!?;,"];
+        wrappers = ignored.copy;
+    });
+    NSString *candidate = [text stringByTrimmingCharactersInSet:wrappers];
+    if (!candidate.length || [candidate rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location != NSNotFound)
+        return NO;
+    NSURLComponents *components = [NSURLComponents componentsWithString:candidate];
+    if (components.host.length &&
+        [@[@"http", @"https"] containsObject:components.scheme.lowercaseString ?: @""]) return YES;
+    NSRange range = NSMakeRange(0, candidate.length);
+    NSTextCheckingResult *link = [detector firstMatchInString:candidate options:0 range:range];
+    NSString *scheme = link.URL.scheme.lowercaseString;
+    return link && NSEqualRanges(link.range, range) && [@[@"http", @"https"] containsObject:scheme ?: @""];
+}
+
 // Keep selection discovery independent of AX transport so nested web selections,
 // secure fields and non-text values can be covered by deterministic regression tests.
 @interface SelectionReader : NSObject
+@property NSRect dragAnchor;
 - (id)attribute:(id)element name:(CFStringRef)name;
 - (id)parameter:(id)element name:(CFStringRef)name value:(id)value;
 - (BOOL)isElement:(id)element;
-- (Selection *)readFocus:(id)focus hit:(id)hit window:(id)window fallback:(NSPoint)fallback;
+- (Selection *)readFocus:(id)focus hit:(id)hit window:(id)window fallback:(NSRect)fallback;
 @end
 @implementation SelectionReader
 - (BOOL)isElement:(id)element { return element && CFGetTypeID((__bridge CFTypeRef)element) == AXUIElementGetTypeID(); }
@@ -269,9 +542,9 @@ static id Attribute(AXUIElementRef element, CFStringRef name) {
     id subrole = [self attribute:element name:kAXSubroleAttribute];
     return [subrole isKindOfClass:NSString.class] && [[subrole lowercaseString] containsString:@"secure"];
 }
-- (Selection *)selected:(id)element fallback:(NSPoint)fallback {
+- (Selection *)selected:(id)element fallback:(NSRect)fallback {
     id raw = [self attribute:element name:kAXSelectedTextAttribute];
-    id range = nil; id bounds = nil;
+    id range = nil; id bounds = nil; id markers = nil;
     if (![raw isKindOfClass:NSString.class] || ![raw length]) {
         id selectedRange=[self attribute:element name:kAXSelectedTextRangeAttribute];
         CFRange characters;
@@ -293,9 +566,9 @@ static id Attribute(AXUIElementRef element, CFStringRef name) {
     // Safari/WebKit often attaches the selection to the web area's text markers,
     // while the focused element is just a heading or a generic container.
     if (![raw isKindOfClass:NSString.class] || ![raw length]) {
-        range = [self attribute:element name:CFSTR("AXSelectedTextMarkerRange")];
-        raw = [self parameter:element name:CFSTR("AXStringForTextMarkerRange") value:range];
-        if ([raw isKindOfClass:NSString.class] && [raw length]) bounds = [self parameter:element name:CFSTR("AXBoundsForTextMarkerRange") value:range];
+        markers = [self attribute:element name:CFSTR("AXSelectedTextMarkerRange")];
+        raw = [self parameter:element name:CFSTR("AXStringForTextMarkerRange") value:markers];
+        if ([raw isKindOfClass:NSString.class] && [raw length]) bounds = [self parameter:element name:CFSTR("AXBoundsForTextMarkerRange") value:markers];
     } else if (!range) {
         range = [self attribute:element name:kAXSelectedTextRangeAttribute];
         bounds = [self parameter:element name:kAXBoundsForRangeParameterizedAttribute value:range];
@@ -303,15 +576,18 @@ static id Attribute(AXUIElementRef element, CFStringRef name) {
     if (![raw isKindOfClass:NSString.class]) return nil;
     NSString *text = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!text.length || text.length > 5000) return nil;
-    NSRect anchor = NSMakeRect(fallback.x, fallback.y, 1, 18);
-    CGRect rect;
-    if (bounds && CFGetTypeID((__bridge CFTypeRef)bounds) == AXValueGetTypeID() && AXValueGetValue((__bridge AXValueRef)bounds, kAXValueCGRectType, &rect) && rect.size.width > 0 && rect.size.height > 0 && isfinite(rect.origin.x) && isfinite(rect.origin.y)) {
-        CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
-        anchor = NSMakeRect(rect.origin.x, top - CGRectGetMaxY(rect), rect.size.width, rect.size.height);
+    NSRect anchor = TextAnchorFromAX(bounds, self.dragAnchor);
+    // Web views can return selected text while exposing its bounds only through markers.
+    if (NSIsEmptyRect(anchor) && !markers) {
+        markers = [self attribute:element name:CFSTR("AXSelectedTextMarkerRange")];
+        anchor = TextAnchorFromAX([self parameter:element name:CFSTR("AXBoundsForTextMarkerRange") value:markers], self.dragAnchor);
     }
-    Selection *selection = [Selection new]; selection.text = text; selection.anchor = anchor; return selection;
+    Selection *selection = [Selection new];
+    selection.text = text;
+    selection.anchor = NSIsEmptyRect(anchor) ? fallback : anchor;
+    return selection;
 }
-- (Selection *)readFocus:(id)focus hit:(id)hit window:(id)window fallback:(NSPoint)fallback {
+- (Selection *)readFocus:(id)focus hit:(id)hit window:(id)window fallback:(NSRect)fallback {
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 0.18;
     if ([self isElement:focus] && [self isSecure:focus]) return nil;
     NSMutableArray *visited = [NSMutableArray new];
@@ -351,7 +627,7 @@ static id Attribute(AXUIElementRef element, CFStringRef name) {
 }
 @end
 
-static Selection *ReadSelection(NSPoint fallback) {
+static Selection *ReadSelection(NSPoint hitPoint, NSRect drag) {
     NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (!front || front.processIdentifier == NSProcessInfo.processInfo.processIdentifier) return nil;
     AXUIElementRef application = AXUIElementCreateApplication(front.processIdentifier);
@@ -376,8 +652,11 @@ static Selection *ReadSelection(NSPoint fallback) {
     id window = Attribute(application, kAXFocusedWindowAttribute);
     AXUIElementRef hit = NULL;
     CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
-    AXUIElementCopyElementAtPosition(application, fallback.x, top - fallback.y, &hit);
-    Selection *selection = [[SelectionReader new] readFocus:focus hit:(__bridge id)hit window:window fallback:fallback];
+    AXUIElementCopyElementAtPosition(application, hitPoint.x, top - hitPoint.y, &hit);
+    SelectionReader *reader = [SelectionReader new];
+    reader.dragAnchor = drag;
+    NSRect fallback = NSIsEmptyRect(drag) ? SelectionAnchorAtPoint(hitPoint) : drag;
+    Selection *selection = [reader readFocus:focus hit:(__bridge id)hit window:window fallback:fallback];
     if (hit) CFRelease(hit); CFRelease(application);
     selection.pid = front.processIdentifier; return selection;
 }
@@ -675,8 +954,9 @@ static NSImage *BlurredBubbleBackground(NSRect frame,NSScreen *screen) {
     [chevron moveToPoint:NSMakePoint(x,y)]; [chevron lineToPoint:NSMakePoint(x+3,y+3)]; [chevron lineToPoint:NSMakePoint(x+6,y)]; [color setStroke]; [chevron stroke];
 }
 @end
-static NSFont *BubbleContentFont(void) {
-    return [NSFont fontWithName:@"STSongti-SC-Light" size:13.0] ?: [NSFont fontWithName:@"Songti SC" size:13.0] ?: [NSFont systemFontOfSize:13.0 weight:NSFontWeightLight];
+static NSString *SelectedBubbleAppearance(void) {
+    NSString *style = [NSUserDefaults.standardUserDefaults stringForKey:@"bubbleAppearance"];
+    return [@[@"white", @"black", @"light", @"dark"] containsObject:style ?: @""] ? style : @"light";
 }
 @interface Bubble : NSObject <NSMenuDelegate>
 @property BubblePanel *panel;
@@ -689,6 +969,7 @@ static NSFont *BubbleContentFont(void) {
 @property (copy) void (^targetChanged)(NSString *);
 @property NSTextField *scrollHint;
 @property NSButton *clipboardButton;
+@property NSButton *speechButton;
 @property BubbleShadeControl *shadeControl;
 @property NSString *appearanceKey;
 @property NSString *translation;
@@ -732,7 +1013,7 @@ static NSFont *BubbleContentFont(void) {
         _scroll.documentView = _textView; [_shape addSubview:_scroll];
         _targetCode = @"zh-CN";
         _languagePicker = [[BubbleLanguagePicker alloc] initWithFrame:NSZeroRect pullsDown:NO];
-        _languagePicker.bordered = NO; _languagePicker.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+        _languagePicker.bordered = NO; _languagePicker.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
         _languagePicker.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
         PopulateLanguages(_languagePicker, self, @selector(languageSelected:));
         _languagePicker.menu.delegate = self;
@@ -750,6 +1031,11 @@ static NSFont *BubbleContentFont(void) {
         _clipboardButton.image=[_clipboardButton.image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular]];
         _clipboardButton.contentTintColor = [NSColor colorWithCalibratedWhite:0.36 alpha:1]; _clipboardButton.toolTip = @"复制完整译文";
         [_shape addSubview:_clipboardButton];
+        _speechButton = [[BubbleButton alloc] initWithFrame:NSZeroRect];
+        _speechButton.bordered = NO;
+        _speechButton.imagePosition = NSImageOnly;
+        UpdateSpeechButton(_speechButton, @"朗读译文", NO);
+        [_shape addSubview:_speechButton];
         _shadeControl=[[BubbleShadeControl alloc] initWithFrame:NSZeroRect];
         _shadeControl.bordered=NO; _shadeControl.imagePosition=NSImageOnly;
         _shadeControl.image=[[NSImage imageWithSystemSymbolName:@"circle.lefthalf.filled" accessibilityDescription:@"背景深浅"] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular]];
@@ -775,7 +1061,7 @@ static NSFont *BubbleContentFont(void) {
     return self.shape.darkAppearance ? [NSColor colorWithCalibratedWhite:0.96 alpha:1] : [NSColor colorWithCalibratedWhite:0.08 alpha:1];
 }
 - (void)applyAppearance {
-    NSString *style=[NSUserDefaults.standardUserDefaults stringForKey:@"bubbleAppearance"] ?: @"light";
+    NSString *style = SelectedBubbleAppearance();
     BOOL dark=[style isEqual:@"dark"] || [style isEqual:@"black"];
     self.shape.darkAppearance=dark;
     self.shape.glassAppearance=![style isEqual:@"white"] && ![style isEqual:@"black"];
@@ -786,11 +1072,12 @@ static NSFont *BubbleContentFont(void) {
     BOOL lightInk=dark;
     self.panel.appearance=[NSAppearance appearanceNamed:lightInk ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     self.languagePicker.appearance=self.panel.appearance;
-    self.languagePicker.contentTintColor=lightInk ? [NSColor colorWithCalibratedWhite:0.92 alpha:1] : [NSColor colorWithCalibratedWhite:0.08 alpha:1];
+    self.languagePicker.contentTintColor=lightInk ? [NSColor colorWithCalibratedWhite:0.83 alpha:1] : [NSColor colorWithCalibratedWhite:0.30 alpha:1];
     self.languagePicker.needsDisplay=YES;
     self.scroll.scrollerKnobStyle=lightInk ? NSScrollerKnobStyleLight : NSScrollerKnobStyleDark;
-    NSColor *tint=lightInk ? [NSColor colorWithCalibratedWhite:0.82 alpha:1] : [NSColor colorWithCalibratedWhite:0.43 alpha:1];
+    NSColor *tint=lightInk ? [NSColor colorWithCalibratedWhite:0.76 alpha:1] : [NSColor colorWithCalibratedWhite:0.47 alpha:1];
     self.swapButton.contentTintColor=tint; self.clipboardButton.contentTintColor=tint; self.shadeControl.contentTintColor=tint;
+    self.speechButton.contentTintColor = tint;
     self.scrollHint.textColor=lightInk ? [NSColor colorWithCalibratedWhite:0.82 alpha:1] : [NSColor colorWithCalibratedWhite:0.48 alpha:1];
     [self.textView.textStorage addAttribute:NSForegroundColorAttributeName value:self.foregroundColor range:NSMakeRange(0,self.textView.string.length)];
     self.shape.needsDisplay=YES;
@@ -822,35 +1109,44 @@ static NSFont *BubbleContentFont(void) {
 }
 - (void)layoutText:(NSString *)text anchor:(NSRect)anchor result:(BOOL)result display:(BOOL)display {
     self.translation = result ? text : nil;
-    NSString *displayText = BubbleDisplayText(text);
     SelectLanguage(self.languagePicker, self.targetCode);
     self.clipboardButton.hidden = !result;
+    self.speechButton.hidden = !result;
     self.clipboardButton.image = [[NSImage imageWithSystemSymbolName:@"doc.on.doc" accessibilityDescription:@"复制完整译文"] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular]];
     self.clipboardButton.toolTip = @"复制完整译文";
     NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
-    for (NSScreen *candidate in NSScreen.screens) if (NSIntersectsRect(candidate.frame, anchor)) { screen = candidate; break; }
+    NSPoint anchorCenter = NSMakePoint(NSMidX(anchor), NSMidY(anchor));
+    for (NSScreen *candidate in NSScreen.screens) if (NSPointInRect(anchorCenter, candidate.frame)) { screen = candidate; break; }
     NSRect visible = NSInsetRect(screen.visibleFrame, 12, 12);
-    NSFont *font = BubbleContentFont();
+    NSFont *font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
+    const CGFloat inset = 18;
+    const CGFloat headerOffset = 28;
+    const CGFloat bodyInset = 8;
+    const CGFloat overhead = 52;
+    const CGFloat scrollFooter = 17;
+    const CGFloat minimumViewport = 20;
     CGFloat singleWidth = [text sizeWithAttributes:@{NSFontAttributeName:font}].width;
     BOOL compact = text.length < 24 && [text rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location == NSNotFound && singleWidth < 270;
-    CGFloat width = MIN(visible.size.width, compact ? MAX(228, ceil(singleWidth) + 48) : 432);
-    CGFloat contentWidth = width - 48;
+    CGFloat width = MIN(visible.size.width, compact ? MAX(result ? 250 : 214, ceil(singleWidth) + 2 * inset) : 420);
+    CGFloat contentWidth = width - 2 * inset;
     NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
     paragraph.lineBreakMode = NSLineBreakByWordWrapping; paragraph.lineSpacing = compact ? 1 : 4;
-    paragraph.paragraphSpacing = compact ? 0 : 6;
+    paragraph.paragraphSpacing = compact ? 0 : 2;
     NSDictionary *attributes = @{NSFontAttributeName:font, NSForegroundColorAttributeName:self.foregroundColor, NSParagraphStyleAttributeName:paragraph};
     self.textView.frame = NSMakeRect(0, 0, contentWidth, 1);
     self.textView.textContainer.containerSize = NSMakeSize(contentWidth, CGFLOAT_MAX);
-    [self.textView.textStorage setAttributedString:[[NSAttributedString alloc] initWithString:displayText attributes:attributes]];
+    [self.textView.textStorage setAttributedString:[[NSAttributedString alloc] initWithString:text attributes:attributes]];
     [self.textView.layoutManager ensureLayoutForTextContainer:self.textView.textContainer];
     NSRect used = [self.textView.layoutManager usedRectForTextContainer:self.textView.textContainer];
-    self.documentHeight = MAX(20, ceil(NSMaxY(used)) + 2);
+    self.documentHeight = MAX(18, ceil(NSMaxY(used)) + 2);
     CGFloat aboveSpace = MAX(0, NSMaxY(visible) - NSMaxY(anchor) - 8);
     CGFloat belowSpace = MAX(0, NSMinY(anchor) - NSMinY(visible) - 8);
-    CGFloat maxHeight = MIN(360, MAX(100, MAX(aboveSpace, belowSpace)));
-    CGFloat overhead = 60;
-    CGFloat maxViewport = MAX(20, maxHeight - overhead - 20);
-    self.scrollable = self.documentHeight > maxViewport;
+    // When there is room to read above the selection, scroll long results there.
+    const CGFloat minimumHeight = overhead + scrollFooter + minimumViewport;
+    CGFloat availableSpace = aboveSpace >= minimumHeight ? aboveSpace : MAX(aboveSpace, belowSpace);
+    CGFloat maxHeight = MIN(360, MAX(minimumHeight, availableSpace));
+    CGFloat maxViewport = maxHeight - overhead - scrollFooter;
+    self.scrollable = self.documentHeight > maxHeight - overhead;
     if (self.scrollable) {
         // Overlay scrollers draw on top of their document. Reflow the text inside
         // a narrower container so final glyphs cannot sit under the thumb.
@@ -859,8 +1155,9 @@ static NSFont *BubbleContentFont(void) {
         NSRect scrolledText = [self.textView.layoutManager usedRectForTextContainer:self.textView.textContainer];
         self.documentHeight = MAX(20, ceil(NSMaxY(scrolledText)) + 2);
     }
-    CGFloat viewport = MIN(self.documentHeight, self.scrollable ? maxViewport : maxHeight - overhead);
-    CGFloat height = viewport + overhead + (self.scrollable ? 20 : 0);
+    CGFloat viewport = self.scrollable ? maxViewport : self.documentHeight;
+    CGFloat footer = self.scrollable ? scrollFooter : 0;
+    CGFloat height = viewport + overhead + footer;
     CGFloat x = MIN(MAX(NSMidX(anchor) - width / 2, NSMinX(visible)), NSMaxX(visible) - width);
     self.shape.pointsDown = aboveSpace >= height || aboveSpace >= belowSpace;
     CGFloat y = self.shape.pointsDown ? NSMaxY(anchor) + 8 : NSMinY(anchor) - height - 8;
@@ -873,13 +1170,18 @@ static NSFont *BubbleContentFont(void) {
     self.shape.frame = NSMakeRect(0, 0, width, height); self.shape.arrowX = NSMidX(anchor) - x;
     CGFloat bodyBottom = self.shape.pointsDown ? 8 : 0;
     CGFloat bodyTop = height - (self.shape.pointsDown ? 0 : 8);
-    self.languagePicker.frame = NSMakeRect(24, bodyTop - 32, 100, 22);
-    self.swapButton.frame = NSMakeRect(125, bodyTop - 32, 24, 22);
-    self.clipboardButton.frame = NSMakeRect(width - 45, bodyTop - 33, 24, 24);
-    self.shadeControl.frame = NSMakeRect(width - 76, bodyTop - 33, 24, 24);
+    self.languagePicker.frame = NSMakeRect(inset, bodyTop - headerOffset, 100, 22);
+    const CGFloat buttonSize = 24;
+    const CGFloat buttonStep = 27;
+    CGFloat lastButtonX = width - inset - buttonSize;
+    CGFloat buttonY = bodyTop - headerOffset - 1;
+    self.clipboardButton.frame = NSMakeRect(lastButtonX, buttonY, buttonSize, buttonSize);
+    self.shadeControl.frame = NSMakeRect(lastButtonX - (result ? buttonStep : 0), buttonY, buttonSize, buttonSize);
+    self.speechButton.frame = NSMakeRect(lastButtonX - 2 * buttonStep, buttonY, buttonSize, buttonSize);
+    self.swapButton.frame = NSMakeRect(lastButtonX - (result ? 3 : 1) * buttonStep, buttonY, buttonSize, buttonSize);
     self.scrollHint.hidden = !self.scrollable;
-    self.scrollHint.frame = NSMakeRect(24, bodyBottom + 10, width - 48, 15);
-    self.scroll.frame = NSMakeRect(24, bodyBottom + 14 + (self.scrollable ? 20 : 0), contentWidth, viewport);
+    self.scrollHint.frame = NSMakeRect(inset, bodyBottom + bodyInset, contentWidth, 15);
+    self.scroll.frame = NSMakeRect(inset, bodyBottom + bodyInset + footer, contentWidth, viewport);
     self.scroll.hasVerticalScroller = self.scrollable;
     self.textView.frame = NSMakeRect(0, 0, contentWidth, self.documentHeight);
     [self.scroll.contentView scrollToPoint:NSZeroPoint]; [self.scroll reflectScrolledClipView:self.scroll.contentView];
@@ -1148,6 +1450,10 @@ static BOOL WasLaunchedAtLogin(NSAppleEventDescriptor *event) {
 @property SPUStandardUpdaterController *updaterController;
 @property id<YiLoginService> loginService;
 @property Bubble *bubble;
+@property SpeechPlayback *speechPlayback;
+@property NSButton *inputSpeechButton;
+@property NSButton *outputSpeechButton;
+@property NSString *spokenResult;
 @property NSStatusItem *status;
 @property NSMenuItem *pauseItem;
 @property NSMenuItem *summaryItem;
@@ -1163,12 +1469,17 @@ static BOOL WasLaunchedAtLogin(NSAppleEventDescriptor *event) {
 @property NSPopUpButton *mainLanguagePicker;
 @property NSSwitch *automaticToggle;
 @property NSTextField *permissionLabel;
+@property NSButton *accessPermissionButton;
+@property NSButton *capturePermissionButton;
 @property NSTimer *permissionTimer;
 @property NSTimer *inputTranslationTimer;
 @property NSMutableArray *monitors;
 @property dispatch_block_t pending;
 @property NSUInteger generation;
 @property NSPoint mouseDown;
+@property BOOL hasMouseDown;
+@property NSRect recentDragAnchor;
+@property pid_t recentDragPID;
 @property BOOL enabled;
 @property BOOL started;
 @property NSTimer *selectionTimer;
@@ -1241,6 +1552,8 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     __weak AppDelegate *weakSelf = self;
     self.bubble.targetCode = self.targetCode;
     self.bubble.targetChanged = ^(NSString *code) { [weakSelf changeTarget:code]; };
+    self.bubble.speechButton.target = self;
+    self.bubble.speechButton.action = @selector(speakText:);
     self.updaterController = [[SPUStandardUpdaterController alloc] initWithStartingUpdater:YES updaterDelegate:nil userDriverDelegate:nil];
     self.status = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     [self updateStatusIcon];
@@ -1357,6 +1670,10 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
 }
 - (void)applicationDidBecomeActive:(NSNotification *)notification { [self restoreWindowFromSwitcher]; }
 - (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.setupWindow) {
+        [self.speechPlayback stopForButton:self.inputSpeechButton];
+        [self.speechPlayback stopForButton:self.outputSpeechButton];
+    }
     if(notification.object==self.setupWindow && self.keepsSwitcherAfterMinimize) {
         self.keepsSwitcherAfterMinimize=NO;
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -1553,6 +1870,35 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
 - (NSButton *)button:(NSString *)title action:(SEL)action frame:(NSRect)frame {
     SoftButton *button=[[SoftButton alloc] initWithFrame:frame]; button.title=title; button.target=self; button.action=action; button.bordered=NO; button.font=[NSFont systemFontOfSize:12 weight:NSFontWeightRegular]; [self.setupWindow.contentView addSubview:button]; return button;
 }
+- (NSButton *)speechButtonWithLabel:(NSString *)label frame:(NSRect)frame {
+    NSButton *button = [[NSButton alloc] initWithFrame:frame];
+    button.bordered = NO;
+    button.imagePosition = NSImageOnly;
+    button.contentTintColor = NSColor.secondaryLabelColor;
+    button.target = self;
+    button.action = @selector(speakText:);
+    UpdateSpeechButton(button, label, NO);
+    [self.setupWindow.contentView addSubview:button];
+    return button;
+}
+- (void)speakText:(NSButton *)sender {
+    BOOL original = sender == self.inputSpeechButton;
+    BOOL floating = sender == self.bubble.speechButton;
+    NSString *text = original ? self.inputView.string : (floating ? self.bubble.translation : self.spokenResult);
+    if (!text.length) return;
+    if (!self.speechPlayback) self.speechPlayback = [SpeechPlayback new];
+    NSString *label = original ? @"朗读原文" : @"朗读译文";
+    NSString *language = original ? nil : (floating ? self.bubble.targetCode : self.targetCode);
+    if (![self.speechPlayback toggleText:text language:language button:sender label:label]) {
+        NSString *message = @"没有可用的朗读语音，可在 macOS 辅助功能中添加语音。";
+        if (floating) sender.toolTip = message;
+        else {
+            self.lastStatus = message;
+            [self updatePermission];
+        }
+        NSBeep();
+    }
+}
 - (void)showSetup:(id)sender {
     if (!self.setupWindow) {
         self.setupWindow=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,760,600) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskFullSizeContentView backing:NSBackingStoreBuffered defer:NO];
@@ -1574,18 +1920,22 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         self.mainLanguagePicker=[[BubbleLanguagePicker alloc] initWithFrame:NSMakeRect(410,447,127,24) pullsDown:NO]; self.mainLanguagePicker.bordered=NO; self.mainLanguagePicker.font=[NSFont systemFontOfSize:12 weight:NSFontWeightMedium]; PopulateLanguages(self.mainLanguagePicker,self,@selector(mainLanguage:)); [self.setupWindow.contentView addSubview:self.mainLanguagePicker];
         [self button:@"⇄" action:@selector(swapMain:) frame:NSMakeRect(542,447,35,24)];
         [self button:@"复制" action:@selector(copyMain:) frame:NSMakeRect(678,447,38,24)];
+        self.inputSpeechButton = [self speechButtonWithLabel:@"朗读原文" frame:NSMakeRect(322,447,30,24)];
+        self.outputSpeechButton = [self speechButtonWithLabel:@"朗读译文" frame:NSMakeRect(640,447,30,24)];
         self.inputView=[self textArea:NSMakeRect(48,213,304,222) editable:YES];
         self.inputView.delegate=self;
         self.inputView.toolTip=@"停止输入后自动翻译 · Shift＋回车换行";
         self.outputView=[self textArea:NSMakeRect(410,213,304,222) editable:NO];
         self.statusLabel=[self rowLabel:@"" frame:NSMakeRect(30,148,500,36) font:[NSFont systemFontOfSize:11.5 weight:NSFontWeightLight]]; self.statusLabel.textColor=[NSColor colorWithCalibratedWhite:0.44 alpha:1];
-        SoftButton *translate=(SoftButton *)[self button:@"翻译   →" action:@selector(translateInput:) frame:NSMakeRect(562,148,170,36)]; translate.prominent=YES; translate.font=[NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-        ReadingCard *preferences=[[ReadingCard alloc] initWithFrame:NSMakeRect(28,51,704,66)]; preferences.subtle=YES; [self.setupWindow.contentView addSubview:preferences];
+        SoftButton *translate=(SoftButton *)[self button:@"翻译 →" action:@selector(translateInput:) frame:NSMakeRect(628,151,104,30)]; translate.prominent=YES; translate.font=[NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+        ReadingCard *preferences=[[ReadingCard alloc] initWithFrame:NSMakeRect(28,58,704,52)]; preferences.subtle=YES; [self.setupWindow.contentView addSubview:preferences];
         self.automaticToggle=[[NSSwitch alloc] initWithFrame:NSMakeRect(44,75,38,22)]; self.automaticToggle.target=self; self.automaticToggle.action=@selector(toggle:); self.automaticToggle.controlSize=NSControlSizeSmall; [self.setupWindow.contentView addSubview:self.automaticToggle];
         [self rowLabel:@"自动划词" frame:NSMakeRect(92,73,100,26) font:[NSFont systemFontOfSize:12 weight:NSFontWeightLight]];
         self.permissionLabel=[self rowLabel:@"" frame:NSMakeRect(204,73,308,26) font:[NSFont systemFontOfSize:10.5 weight:NSFontWeightLight]]; self.permissionLabel.textColor=[NSColor colorWithCalibratedWhite:0.48 alpha:1];
-        NSButton *access=[self button:@"划词权限" action:@selector(openPermissions:) frame:NSMakeRect(530,73,88,26)]; access.font=[NSFont systemFontOfSize:10.5];
-        NSButton *screen=[self button:@"截图权限" action:@selector(openCapturePermissions:) frame:NSMakeRect(626,73,88,26)]; screen.font=[NSFont systemFontOfSize:10.5];
+        self.accessPermissionButton=[self button:@"划词权限" action:@selector(openPermissions:) frame:NSMakeRect(530,73,88,26)];
+        self.capturePermissionButton=[self button:@"截图权限" action:@selector(openCapturePermissions:) frame:NSMakeRect(626,73,88,26)];
+        self.accessPermissionButton.font=[NSFont systemFontOfSize:10.5];
+        self.capturePermissionButton.font=[NSFont systemFontOfSize:10.5];
         NSTextField *privacy=[self label:@"气泡背景与截图仅在本机处理  ·  原文发送至所选翻译服务  ·  不保存历史" frame:NSMakeRect(30,18,704,20) font:[NSFont systemFontOfSize:10.5 weight:NSFontWeightLight]]; privacy.textColor=[NSColor colorWithCalibratedWhite:0.55 alpha:1];
         [self.setupWindow center]; __weak AppDelegate *weakSelf=self;
         self.permissionTimer=[NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer){ [weakSelf updatePermission]; }];
@@ -1613,7 +1963,7 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     [self.appearanceMenus addObject:menu]; return menu;
 }
 - (void)updateBubbleAppearance {
-    NSString *selected=[NSUserDefaults.standardUserDefaults stringForKey:@"bubbleAppearance"] ?: @"light";
+    NSString *selected = SelectedBubbleAppearance();
     for(NSMenu *menu in self.appearanceMenus) for(NSMenuItem *item in menu.itemArray) item.state=[item.representedObject isEqual:selected] ? NSControlStateValueOn : NSControlStateValueOff;
     [self.bubble applyAppearance];
 }
@@ -1678,11 +2028,27 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     if ([alert runModal] != NSAlertFirstButtonReturn) return NO;
     [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"onlineTranslationAccepted"]; return YES;
 }
+- (void)updatePermissionIndicatorsWithSelection:(BOOL)selection capture:(BOOL)capture {
+    self.accessPermissionButton.hidden = selection;
+    self.capturePermissionButton.hidden = capture;
+    NSRect accessFrame = self.accessPermissionButton.frame;
+    accessFrame.origin.x = NSMinX(self.capturePermissionButton.frame) - (capture ? 0 : NSWidth(accessFrame) + 8);
+    self.accessPermissionButton.frame = accessFrame;
+    if (selection && capture) {
+        self.permissionLabel.stringValue = @"权限已就绪";
+    } else if (!selection && !capture) {
+        self.permissionLabel.stringValue = @"需要开启划词和截图权限";
+    } else {
+        self.permissionLabel.stringValue = selection ? @"需要开启截图权限" : @"需要开启划词权限";
+    }
+}
 - (void)updatePermission {
-    self.permissionLabel.stringValue = [NSString stringWithFormat:@"划词权限：%@    截图权限：%@", AXIsProcessTrusted() ? @"已开启" : @"待开启", CGPreflightScreenCaptureAccess() ? @"已开启" : @"待开启"];
+    [self updatePermissionIndicatorsWithSelection:AXIsProcessTrusted() capture:CGPreflightScreenCaptureAccess()];
     self.statusLabel.stringValue = self.lastStatus ?: @"停止输入后自动翻译，Shift＋回车换行。";
     self.automaticToggle.state = self.started && self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.pauseItem.state=self.started && self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.inputSpeechButton.enabled = [self.inputView.string stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length > 0;
+    self.outputSpeechButton.enabled = self.spokenResult.length > 0;
 }
 - (void)openPermissions:(id)sender {
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@YES});
@@ -1701,15 +2067,22 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     id local = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         return [weakSelf handleLocalEvent:event] ?: event;
     }]; if (local) [self.monitors addObject:local];
-    Selection *baseline = ReadSelection(NSEvent.mouseLocation); self.lastSelectionKey = baseline ? [NSString stringWithFormat:@"%d:%@",baseline.pid,baseline.text] : @"";
+    Selection *baseline = ReadSelection(NSEvent.mouseLocation, NSZeroRect); self.lastSelectionKey = baseline ? [NSString stringWithFormat:@"%d:%@",baseline.pid,baseline.text] : @"";
     self.selectionTimer = [NSTimer scheduledTimerWithTimeInterval:0.35 repeats:YES block:^(NSTimer *timer) {
         AppDelegate *self = weakSelf;
-        if (!self || !self.enabled || self.captureInProgress || self.compatibilityReader.busy || self.bubble.isInteracting || (NSEvent.pressedMouseButtons & 1)) return;
+        if (!self || !self.enabled || self.pending || self.captureInProgress || self.compatibilityReader.busy || self.bubble.isInteracting || (NSEvent.pressedMouseButtons & 1)) return;
         if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == NSProcessInfo.processInfo.processIdentifier) return;
-        Selection *selection = ReadSelection(NSEvent.mouseLocation);
+        NSPoint point = NSEvent.mouseLocation;
+        NSRect drag = [self currentDragAnchor];
+        Selection *selection = ReadSelection(point, drag);
         NSString *key = selection ? [NSString stringWithFormat:@"%d:%@",selection.pid,selection.text] : @"";
         if ([key isEqual:self.lastSelectionKey]) return; self.lastSelectionKey = key;
-        if (selection) [self schedule:NSEvent.mouseLocation]; else if ([self.activeContext isEqual:@"selection"]) [self cancel];
+        if (selection && !IsStandaloneWebLink(selection.text)) {
+            [self schedule:point dragAnchor:drag allowCompatibility:NO];
+        } else if ([self.activeContext isEqual:@"selection"] ||
+                   (selection && [self.activeContext isEqual:@"compatibility"])) {
+            [self cancel];
+        }
     }];
 }
 - (NSEvent *)handleLocalEvent:(NSEvent *)event {
@@ -1723,7 +2096,10 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
 }
 - (void)appChanged:(NSNotification *)notification {
     NSRunningApplication *activated=notification.userInfo[NSWorkspaceApplicationKey] ?: NSWorkspace.sharedWorkspace.frontmostApplication;
-    if(activated && activated.processIdentifier != NSProcessInfo.processInfo.processIdentifier) [self dismissStatusMenu];
+    if (activated && activated.processIdentifier != NSProcessInfo.processInfo.processIdentifier) {
+        [self dismissStatusMenu];
+        if (activated.processIdentifier != self.recentDragPID) self.recentDragAnchor = NSZeroRect;
+    }
     if (self.captureInProgress || self.bubble.isInteracting) return;
     if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == NSProcessInfo.processInfo.processIdentifier) { [self restoreWindowFromSwitcher]; return; }
     if (([self.activeContext isEqual:@"selection"] || [self.activeContext isEqual:@"compatibility"]) && NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != self.activePID) [self cancel];
@@ -1735,35 +2111,84 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     }
     if (self.bubble.languageMenuOpen || NSProcessInfo.processInfo.systemUptime < self.bubble.interactionUntil) return;
     switch (event.type) {
-        case NSEventTypeLeftMouseDown: self.mouseDown = NSEvent.mouseLocation; if (!self.bubble.panel.visible || !NSPointInRect(self.mouseDown,self.bubble.panel.frame)) [self cancel]; break;
+        case NSEventTypeLeftMouseDown:
+            self.mouseDown = event.CGEvent ? CGEventGetUnflippedLocation(event.CGEvent) : NSEvent.mouseLocation;
+            self.hasMouseDown = YES;
+            self.recentDragAnchor = NSZeroRect;
+            if (!self.bubble.panel.visible || !NSPointInRect(self.mouseDown, self.bubble.panel.frame)) [self cancel];
+            break;
         case NSEventTypeLeftMouseUp: {
-            NSPoint point = NSEvent.mouseLocation; if (self.bubble.panel.visible && NSPointInRect(point,self.bubble.panel.frame)) break;
-            if (hypot(point.x-self.mouseDown.x,point.y-self.mouseDown.y)>3 || event.clickCount>=2) [self schedule:point]; break;
+            NSPoint point = event.CGEvent ? CGEventGetUnflippedLocation(event.CGEvent) : NSEvent.mouseLocation;
+            BOOL dragged = self.hasMouseDown && hypot(point.x - self.mouseDown.x, point.y - self.mouseDown.y) > 3;
+            self.hasMouseDown = NO;
+            if (self.bubble.panel.visible && NSPointInRect(point, self.bubble.panel.frame)) break;
+            if (dragged || event.clickCount >= 2) {
+                self.recentDragAnchor = dragged ? SelectionAnchorForDrag(self.mouseDown, point) : NSZeroRect;
+                self.recentDragPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+                [self schedule:point dragAnchor:self.recentDragAnchor allowCompatibility:YES];
+            }
+            break;
         }
-        case NSEventTypeKeyUp: if ((event.modifierFlags & NSEventModifierFlagShift) && event.keyCode>=123 && event.keyCode<=126) [self schedule:NSEvent.mouseLocation]; break;
-        case NSEventTypeKeyDown: if (event.keyCode==53 || !(event.modifierFlags & NSEventModifierFlagShift)) [self cancel]; break;
-        case NSEventTypeScrollWheel: if (self.bubble.panel.visible && NSPointInRect(NSEvent.mouseLocation,self.bubble.panel.frame)) break; [self cancel]; break;
-        case NSEventTypeRightMouseDown: [self cancel]; break;
+        case NSEventTypeKeyUp:
+            if ((event.modifierFlags & NSEventModifierFlagShift) && event.keyCode >= 123 && event.keyCode <= 126) {
+                self.recentDragAnchor = NSZeroRect;
+                [self schedule:NSEvent.mouseLocation dragAnchor:NSZeroRect allowCompatibility:YES];
+            }
+            break;
+        case NSEventTypeKeyDown:
+            self.recentDragAnchor = NSZeroRect;
+            if (event.keyCode == 53 || !(event.modifierFlags & NSEventModifierFlagShift)) [self cancel];
+            break;
+        case NSEventTypeScrollWheel:
+            if (self.bubble.panel.visible && NSPointInRect(NSEvent.mouseLocation, self.bubble.panel.frame)) break;
+            self.recentDragAnchor = NSZeroRect;
+            [self cancel];
+            break;
+        case NSEventTypeRightMouseDown:
+            self.recentDragAnchor = NSZeroRect;
+            [self cancel];
+            break;
         default: break;
     }
 }
-- (void)cancel { [self.inputTranslationTimer invalidate]; self.inputTranslationTimer=nil; if (self.pending) dispatch_block_cancel(self.pending); self.pending = nil; self.generation++; [self.compatibilityReader cancel]; [self.translator cancel]; [self.bubble hide]; }
-- (void)schedule:(NSPoint)point { [self cancel]; __weak AppDelegate *weakSelf = self; self.pending = dispatch_block_create(0,^{ [weakSelf translateSelection:point]; }); dispatch_after(dispatch_time(DISPATCH_TIME_NOW,220*NSEC_PER_MSEC),dispatch_get_main_queue(),self.pending); }
-- (void)translateSelection:(NSPoint)point {
-    if (!self.enabled || !AXIsProcessTrusted()) return;
-    Selection *selection = ReadSelection(point); if (!selection) { [self tryCompatibility:point manual:NO]; return; }
-    self.lastSelectionKey = [NSString stringWithFormat:@"%d:%@",selection.pid,selection.text];
-    [self runTranslation:selection.text anchor:selection.anchor context:@"selection" pid:selection.pid];
+- (void)cancel { [self.inputTranslationTimer invalidate]; self.inputTranslationTimer=nil; if (self.pending) dispatch_block_cancel(self.pending); self.pending = nil; self.generation++; [self.compatibilityReader cancel]; [self.translator cancel]; [self.speechPlayback stopForButton:self.bubble.speechButton]; [self.bubble hide]; }
+- (NSRect)currentDragAnchor {
+    pid_t pid = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    return pid == self.recentDragPID ? self.recentDragAnchor : NSZeroRect;
 }
-- (void)tryCompatibility:(NSPoint)point manual:(BOOL)manual {
-    if(![NSUserDefaults.standardUserDefaults boolForKey:@"compatibilityCopyEnabled"]) { if(manual) [self showSelectionHint:point]; return; }
+- (void)schedule:(NSPoint)point dragAnchor:(NSRect)drag allowCompatibility:(BOOL)allowCompatibility {
+    [self cancel];
+    __weak AppDelegate *weakSelf = self;
+    self.pending = dispatch_block_create(0, ^{
+        AppDelegate *delegate = weakSelf;
+        delegate.pending = nil;
+        [delegate translateSelection:point dragAnchor:drag allowCompatibility:allowCompatibility];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150*NSEC_PER_MSEC), dispatch_get_main_queue(), self.pending);
+}
+- (void)translateSelection:(NSPoint)point dragAnchor:(NSRect)drag allowCompatibility:(BOOL)allowCompatibility {
+    if (!self.enabled || !AXIsProcessTrusted()) return;
+    Selection *selection = ReadSelection(point, drag);
+    if (selection) {
+        [self submitSelectionText:selection.text anchor:selection.anchor context:@"selection" pid:selection.pid manual:NO];
+    } else if (allowCompatibility) {
+        [self tryCompatibility:NSIsEmptyRect(drag) ? SelectionAnchorAtPoint(point) : drag manual:NO];
+    }
+}
+- (void)submitSelectionText:(NSString *)text anchor:(NSRect)anchor context:(NSString *)context pid:(pid_t)pid manual:(BOOL)manual {
+    self.lastSelectionKey = [NSString stringWithFormat:@"%d:%@", pid, text];
+    if (!manual && IsStandaloneWebLink(text)) return;
+    [self runTranslation:text anchor:anchor context:context pid:pid];
+}
+- (void)tryCompatibility:(NSRect)anchor manual:(BOOL)manual {
+    if(![NSUserDefaults.standardUserDefaults boolForKey:@"compatibilityCopyEnabled"]) { if(manual) [self showSelectionHint:anchor]; return; }
     NSRunningApplication *front=NSWorkspace.sharedWorkspace.frontmostApplication;
-    if(!SelectionCopyAllowed(front)) { if(manual) [self showSelectionHint:point]; return; }
+    if(!SelectionCopyAllowed(front)) { if(manual) [self showSelectionHint:anchor]; return; }
     AXUIElementRef app=AXUIElementCreateApplication(front.processIdentifier); AXUIElementSetMessagingTimeout(app,0.04);
     id item=CopyMenuItem(app); CFRelease(app);
     // Automatic fallback requires the app's own enabled Copy command. Never
     // manufacture a copy when dragging files, controls or an unselected page.
-    if(!item) { if(manual) [self showSelectionHint:point]; return; }
+    if(!item) { if(manual) [self showSelectionHint:anchor]; return; }
     [self cancel]; NSUInteger generation=self.generation; pid_t pid=front.processIdentifier;
     [self.compatibilityReader readCopy:^BOOL{
         AXUIElementSetMessagingTimeout((__bridge AXUIElementRef)item,0.20);
@@ -1772,28 +2197,27 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         return self.generation==generation && NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier==pid && !self.captureInProgress;
     } completion:^(NSString *text){
         if(self.generation!=generation) return;
-        if(!text.length) { if(manual) [self showSelectionHint:point]; return; }
-        self.lastSelectionKey=[NSString stringWithFormat:@"%d:%@",pid,text];
-        [self runTranslation:text anchor:NSMakeRect(point.x,point.y,1,18) context:@"compatibility" pid:pid];
+        if(!text.length) { if(manual) [self showSelectionHint:anchor]; return; }
+        [self submitSelectionText:text anchor:anchor context:@"compatibility" pid:pid manual:manual];
     }];
 }
-- (void)showSelectionHint:(NSPoint)point {
+- (void)showSelectionHint:(NSRect)anchor {
     [self cancel]; self.activeText=nil; self.activeContext=nil;
     NSString *captureKey=[(self.shortcuts ?: YiDefaultShortcuts())[YiShortcutCapture] displayString];
-    [self.bubble show:[NSString stringWithFormat:@"未读取到文字选区，请重新选择，或按 %@ 截图翻译。",captureKey] anchor:NSMakeRect(point.x,point.y,1,18) result:NO];
+    [self.bubble show:[NSString stringWithFormat:@"未读取到文字选区，请重新选择，或按 %@ 截图翻译。",captureKey] anchor:anchor result:NO];
 }
 - (void)translateSelectedText:(id)sender {
     if (self.captureInProgress) return;
     if (!AXIsProcessTrusted()) { [self openPermissions:nil]; return; }
     // Explicit translation remains available while automatic selection is paused.
     NSPoint point=NSEvent.mouseLocation;
-    Selection *selection=ReadSelection(point);
+    NSRect drag = [self currentDragAnchor];
+    Selection *selection = ReadSelection(point, drag);
     if (!selection) {
-        [self tryCompatibility:point manual:YES];
+        [self tryCompatibility:NSIsEmptyRect(drag) ? SelectionAnchorAtPoint(point) : drag manual:YES];
         return;
     }
-    self.lastSelectionKey=[NSString stringWithFormat:@"%d:%@",selection.pid,selection.text];
-    [self runTranslation:selection.text anchor:selection.anchor context:@"selection" pid:selection.pid];
+    [self submitSelectionText:selection.text anchor:selection.anchor context:@"selection" pid:selection.pid manual:YES];
 }
 - (void)runTranslation:(NSString *)text anchor:(NSRect)anchor context:(NSString *)context pid:(pid_t)pid {
     if (![self onlineEnabled]) return;
@@ -1802,8 +2226,13 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     self.translator.targetLanguage = self.targetCode;
     NSUInteger generation = ++self.generation;
     BOOL floating = ![context isEqual:@"input"];
+    [self.speechPlayback stopForButton:self.outputSpeechButton];
+    self.spokenResult = nil;
     self.lastStatus = [NSString stringWithFormat:@"正在翻译成%@…",LanguageName(self.targetCode)];
-    if (self.inputView && floating) self.inputView.string = text;
+    if (self.inputView && floating) {
+        if (![self.inputView.string isEqualToString:text]) [self.speechPlayback stopForButton:self.inputSpeechButton];
+        self.inputView.string = text;
+    }
     if (floating) [self.bubble show:@"翻译中…" anchor:anchor result:NO];
     [self updatePermission];
     [self.translator translate:text completion:^(NSString *result,NSError *error) {
@@ -1811,9 +2240,17 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         pid_t currentPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
         if (([context isEqual:@"selection"] || [context isEqual:@"compatibility"]) && currentPID != pid && currentPID != NSProcessInfo.processInfo.processIdentifier) return;
         NSString *failure=TranslationFailureMessage(error);
+        NSString *partialNote = result && YoudaoUnsupportedLanguage(error)
+            ? @"有道不支持部分语种，已保留原文。可在「翻译源」切换到 Google。"
+            : nil;
         self.outputView.string = result ?: failure;
-        self.lastStatus = result ? [NSString stringWithFormat:@"已翻译成%@",LanguageName(self.targetCode)] : failure;
-        if (floating) [self.bubble show:result ?: failure anchor:anchor result:result!=nil];
+        self.spokenResult = result;
+        self.lastStatus = partialNote ?: (result ? [NSString stringWithFormat:@"已翻译成%@",LanguageName(self.targetCode)] : failure);
+        if (floating) {
+            NSString *display = partialNote ? [NSString stringWithFormat:@"%@\n\n%@", result, partialNote] : (result ?: failure);
+            [self.bubble show:display anchor:anchor result:result!=nil];
+            if (partialNote) self.bubble.translation = result;
+        }
         [self updatePermission];
     }];
 }
@@ -1836,11 +2273,14 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
     // Cancel the old request immediately so a late response cannot replace the
     // result for newly edited text during the debounce interval.
     [self cancel]; self.activeText=nil; self.activeContext=@"input";
+    [self.speechPlayback stopForButton:self.inputSpeechButton];
+    [self.speechPlayback stopForButton:self.outputSpeechButton];
+    self.spokenResult = nil;
     NSString *text=[self.inputView.string stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     self.outputView.string=@"";
     self.lastStatus=text.length>5000 ? @"每次请翻译 1–5000 字的文字。" : (text.length ? @"停止输入后自动翻译…" : nil);
     [self updatePermission];
-    if(text.length && text.length<=5000) [self scheduleInputTranslationAfter:0.6];
+    if(text.length && text.length<=5000) [self scheduleInputTranslationAfter:0.4];
 }
 - (BOOL)textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
     // Let the input method consume Return to confirm marked Chinese/Japanese
@@ -2003,13 +2443,14 @@ static OSStatus TranslationHotkeyHandler(EventHandlerCallRef handler, EventRef e
         NSError *error=nil; NSString *text=RecognizeImage(image,&error); CGImageRelease(image);
         dispatch_async(dispatch_get_main_queue(),^{
             self.captureInProgress=NO;
-            Selection *baseline=ReadSelection(NSEvent.mouseLocation); self.lastSelectionKey=baseline ? [NSString stringWithFormat:@"%d:%@",baseline.pid,baseline.text] : @"";
+            Selection *baseline=ReadSelection(NSEvent.mouseLocation, NSZeroRect); self.lastSelectionKey=baseline ? [NSString stringWithFormat:@"%d:%@",baseline.pid,baseline.text] : @"";
             if (!text.length) { self.lastStatus=error ? @"截图识别失败，请重试。" : @"没有识别到文字，请缩小选区并重试。"; [self showSetup:nil]; return; }
             [self runTranslation:text anchor:rect context:@"capture" pid:0];
         });
     });
 }
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self.speechPlayback stop];
     [self stopStatusMenuDismissMonitor];
     [self unregisterShortcutKeys];
 }
@@ -2029,7 +2470,7 @@ static int RunLayoutTests(NSString *directory) {
         [bubble layoutText:samples[i] anchor:anchor result:YES display:NO];
         [bubble.textView.layoutManager ensureLayoutForTextContainer:bubble.textView.textContainer];
         NSRange glyphs = [bubble.textView.layoutManager glyphRangeForTextContainer:bubble.textView.textContainer];
-        BOOL complete = [bubble.translation isEqualToString:samples[i]] && [bubble.textView.string isEqualToString:BubbleDisplayText(samples[i])] && NSMaxRange(glyphs) == bubble.textView.layoutManager.numberOfGlyphs;
+        BOOL complete = [bubble.translation isEqualToString:samples[i]] && [bubble.textView.string isEqualToString:samples[i]] && NSMaxRange(glyphs) == bubble.textView.layoutManager.numberOfGlyphs;
         BOOL fits = NSContainsRect(NSInsetRect(screen, 12, 12), bubble.panel.frame);
         if (!complete || !fits || (i == 2 && !bubble.scrollable)) { fprintf(stderr,"FAIL: layout case %lu\n", (unsigned long)i); return 1; }
         NSRect last = [bubble.textView.layoutManager boundingRectForGlyphRange:NSMakeRange(glyphs.length - 1, 1) inTextContainer:bubble.textView.textContainer];
